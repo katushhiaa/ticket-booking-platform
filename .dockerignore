@@ -1,0 +1,15 @@
+**/bin/
+**/obj/
+**/.git/
+**/.vs/
+**/.vscode/
+**/.idea/
+**/*.user
+**/*.DotSettings.user
+**/.DS_Store
+postman/
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md
+tests/

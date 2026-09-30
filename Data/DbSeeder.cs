@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Identity;
 using TicketBooking.Api.Models;
 using TicketBooking.Api.Models.Enums;
 
@@ -5,6 +6,12 @@ namespace TicketBooking.Api.Data;
 
 public static class DbSeeder
 {
+    /// <summary>Пароль тестового користувача katerina@example.com (для демонстрації /api/v1/auth/login).</summary>
+    public const string DemoUserPassword = "Katerina123";
+
+    /// <summary>Скільки квитків фан-зони згенерувати (щоб сценарій захисту можна було проганяти кілька разів).</summary>
+    private const int FanZoneTicketsToSeed = 30;
+
     public static void SeedInitialData(AppDbContext context)
     {
         if (context.Events.Any()) return;
@@ -58,6 +65,7 @@ public static class DbSeeder
             Email = "katerina@example.com",
             FullName = "Катерина"
         };
+        user.PasswordHash = new PasswordHasher<User>().HashPassword(user, DemoUserPassword);
 
         var ev = new Event
         {
@@ -68,7 +76,7 @@ public static class DbSeeder
             StartsAt = DateTime.UtcNow.AddDays(14),
             Status = EventStatus.Published
         };
-        
+
          var ticket1 = new Ticket
         {
             Id = Guid.Parse("7b0a793c-23a5-4e89-bbf2-5400d33e680a"),
@@ -89,22 +97,26 @@ public static class DbSeeder
             Status = TicketStatus.Available
         };
 
-        var ticketFan = new Ticket
-        {
-            Id = Guid.NewGuid(),
-            EventId = ev.Id,
-            SectionId = fanSection.Id,
-            SeatSlotId = null, 
-            Price = 600m,
-            Status = TicketStatus.Available
-        };
+        // Квитки фан-зони (без прив'язки до крісла, SeatSlotId = null)
+        var fanTickets = Enumerable.Range(0, FanZoneTicketsToSeed)
+            .Select(_ => new Ticket
+            {
+                Id = Guid.NewGuid(),
+                EventId = ev.Id,
+                SectionId = fanSection.Id,
+                SeatSlotId = null,
+                Price = 600m,
+                Status = TicketStatus.Available
+            })
+            .ToList();
 
         context.Venues.Add(venue);
         context.Sections.AddRange(parterSection, fanSection);
         context.SeatSlots.AddRange(seat1, seat2);
         context.Users.Add(user);
         context.Events.Add(ev);
-        context.Tickets.AddRange(ticket1, ticket2, ticketFan);
+        context.Tickets.AddRange(ticket1, ticket2);
+        context.Tickets.AddRange(fanTickets);
 
         context.SaveChanges();
     }

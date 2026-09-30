@@ -1,6 +1,126 @@
-@TicketBooking.Api_HostAddress = http://localhost:5192
+### Ticket Booking API — сценарій захисту
+### Формат: VS Code REST Client / Visual Studio 2022 (17.12+). Повна версія з автотестами — postman/TicketBooking.postman_collection.json
 
-GET {{TicketBooking.Api_HostAddress}}/weatherforecast/
+@baseUrl = http://localhost:5192
+@userId = 8a7d183f-6712-401c-b26a-9f5e13d1fa82
+@eventId = e5b87192-3c2b-4d43-9821-82d2cbb54d01
+
+### 1. Список подій
+GET {{baseUrl}}/api/v1/events
 Accept: application/json
 
-###
+### 2. Вільні квитки події (id підставляються у змінні автоматично)
+# @name tickets
+GET {{baseUrl}}/api/v1/events/{{eventId}}/tickets?status=Available
+Accept: application/json
+
+@ticketId1 = {{tickets.response.body.$.tickets[0].id}}
+@ticketId2 = {{tickets.response.body.$.tickets[1].id}}
+@ticketId3 = {{tickets.response.body.$.tickets[2].id}}
+
+### 3. Бронювання двох квитків → 201 Created
+# @name createBooking
+POST {{baseUrl}}/api/v1/bookings
+Content-Type: application/json
+
+{
+  "userId": "{{userId}}",
+  "ticketIds": ["{{ticketId1}}", "{{ticketId2}}"]
+}
+
+@bookingId = {{createBooking.response.body.$.id}}
+
+### 4. Повторне бронювання того самого квитка → 409 Conflict
+POST {{baseUrl}}/api/v1/bookings
+Content-Type: application/json
+
+{
+  "userId": "{{userId}}",
+  "ticketIds": ["{{ticketId1}}"]
+}
+
+### 5. Підтвердження оплати → 200 OK + штрихкоди
+POST {{baseUrl}}/api/v1/bookings/{{bookingId}}/confirm
+Content-Type: application/json
+
+{
+  "paymentTransactionId": "PAY-DEMO-000001"
+}
+
+### 6a. Нове бронювання для скасування
+# @name bookingToCancel
+POST {{baseUrl}}/api/v1/bookings
+Content-Type: application/json
+
+{
+  "userId": "{{userId}}",
+  "ticketIds": ["{{ticketId3}}"]
+}
+
+### 6b. Скасування → 204 No Content
+DELETE {{baseUrl}}/api/v1/bookings/{{bookingToCancel.response.body.$.id}}
+
+### 6c. Перевірка: квиток знову Available
+GET {{baseUrl}}/api/v1/events/{{eventId}}/tickets
+Accept: application/json
+
+### Бронювання за id
+GET {{baseUrl}}/api/v1/bookings/{{bookingId}}
+Accept: application/json
+
+### ---------- Негативні кейси ----------
+
+### Валідація: більше 4 квитків → 400
+POST {{baseUrl}}/api/v1/bookings
+Content-Type: application/json
+
+{
+  "userId": "{{userId}}",
+  "ticketIds": [
+    "11111111-0000-0000-0000-000000000001",
+    "11111111-0000-0000-0000-000000000002",
+    "11111111-0000-0000-0000-000000000003",
+    "11111111-0000-0000-0000-000000000004",
+    "11111111-0000-0000-0000-000000000005"
+  ]
+}
+
+### Валідація: короткий PaymentTransactionId → 400
+POST {{baseUrl}}/api/v1/bookings/{{bookingId}}/confirm
+Content-Type: application/json
+
+{
+  "paymentTransactionId": "123"
+}
+
+### Скасування оплаченої броні → 409
+DELETE {{baseUrl}}/api/v1/bookings/{{bookingId}}
+
+### ---------- Авторизація ----------
+
+### Реєстрація → 201
+POST {{baseUrl}}/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "email": "student@example.com",
+  "password": "Passw0rd123",
+  "fullName": "Тестовий Студент"
+}
+
+### Вхід тестового користувача → 200 + JWT
+# @name login
+POST {{baseUrl}}/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "katerina@example.com",
+  "password": "Katerina123"
+}
+
+### Профіль поточного користувача → 200
+GET {{baseUrl}}/api/v1/auth/me
+Authorization: Bearer {{login.response.body.$.accessToken}}
+
+### Без токена → 401
+GET {{baseUrl}}/api/v1/auth/me
