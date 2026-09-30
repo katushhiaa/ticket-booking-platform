@@ -1,0 +1,71 @@
+name: ticket-booking
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ticket-booking-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ticket_booking_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      # Іменований volume: дані переживають restart / down (але не down -v)
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ticket_booking_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - booking-net
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ticket-booking-api:latest
+    container_name: ticket-booking-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        # API стартує лише після того, як pg_isready відповість успіхом
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_HTTP_PORTS: "8080"
+      # Хост = ім'я сервісу бази у спільній мережі
+      ConnectionStrings__DefaultConnection: "Host=db;Port=5432;Database=ticket_booking_db;Username=postgres;Password=postgres"
+      Jwt__SigningKey: "docker-compose-signing-key-for-lab-only-9f3c2a7e5b1d4c6f8a0e"
+    ports:
+      - "5192:8080"
+    networks:
+      - booking-net
+
+  # Інтеграційні тести (profile "tests", не стартує з `docker compose up`):
+  #   docker compose --profile tests run --rm tests
+  # Тести самі піднімають тимчасовий PostgreSQL через Testcontainers, тому потрібен доступ до docker.sock.
+  tests:
+    profiles: ["tests"]
+    image: mcr.microsoft.com/dotnet/sdk:9.0
+    working_dir: /src
+    volumes:
+      - .:/src
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Контейнер Postgres від Testcontainers публікується на хості Docker, а не на localhost тест-контейнера
+      TESTCONTAINERS_HOST_OVERRIDE: host.docker.internal
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: dotnet test tests/TicketBooking.IntegrationTests --logger "console;verbosity=minimal"
+
+volumes:
+  pgdata:
+
+networks:
+  booking-net:
+    driver: bridge

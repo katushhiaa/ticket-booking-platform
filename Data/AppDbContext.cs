@@ -21,12 +21,26 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         modelBuilder.Entity<Section>().Property(s => s.Type).HasConversion<string>();
         modelBuilder.Entity<Ticket>().Property(t => t.Status).HasConversion<string>();
         modelBuilder.Entity<Booking>().Property(b => b.Status).HasConversion<string>();
-        
+
         modelBuilder.Entity<SeatSlot>()
             .HasIndex(s => new { s.SectionId, s.RowNumber, s.SeatNumber })
             .IsUnique();
 
         modelBuilder.Entity<Ticket>()
             .HasIndex(t => new { t.EventId, t.Status });
+
+        // Штрихкод квитка унікальний (NULL у непроданих квитків PostgreSQL не вважає дублікатами)
+        modelBuilder.Entity<Ticket>()
+            .HasIndex(t => t.Barcode)
+            .IsUnique();
+
+        // Email — логін користувача, тому унікальний
+        modelBuilder.Entity<User>()
+            .HasIndex(u => u.Email)
+            .IsUnique();
+
+        // Для фонового прибирання прострочених резервів (Status = Pending AND ExpiresAt < now)
+        modelBuilder.Entity<Booking>()
+            .HasIndex(b => new { b.Status, b.ExpiresAt });
     }
 }
