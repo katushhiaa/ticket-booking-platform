@@ -21,6 +21,13 @@ builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection"))
         .AddInterceptors(new PooledConnectionValidator()));
 
+// ---------- Distributed Cache (Redis for Stateless Architecture - Lab 2) ----------
+builder.Services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = builder.Configuration.GetConnectionString("RedisConnection") ?? "redis:6379";
+    options.InstanceName = "TicketBooking_";
+});
+
 // ---------- MVC + Input Validation ----------
 builder.Services
     .AddControllers(options =>
@@ -124,7 +131,15 @@ builder.Services.AddSwaggerGen(options =>
 
 var app = builder.Build();
 
-// Має стояти першим: перехоплює винятки з усього конвеєра і віддає ProblemDetails замість стек-трейсу
+// ---------- Node Identification Middleware (Lab 2 — X-Instance-ID) ----------
+// Стоїть на самому початку, щоб додавати заголовок у всі відповіді (навіть 401/409/500)
+app.Use(async (context, next) =>
+{
+    context.Response.Headers["X-Instance-ID"] = Environment.MachineName;
+    await next();
+});
+
+// Має стояти далі: перехоплює винятки з усього конвеєра і віддає ProblemDetails замість стек-трейсу
 app.UseExceptionHandler();
 // Порожні 404/405/401 теж віддаються як ProblemDetails
 app.UseStatusCodePages();

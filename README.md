@@ -1,14 +1,149 @@
-# Concert Ticketing Engine (High-Load Booking Platform)
+# Concert Ticketing Engine (High-Load & Stateless Booking Platform)
 
-Платформа для онлайн-бронювання та продажу квитків на концерти в умовах високої конкуренції за спільні ресурси (High Contention / Flash Crowds). Систему спроєктовано з урахуванням пікових навантажень на старті продажів популярних подій із забезпеченням транзакційної цілісності та захисту від подвійного продажу (Double-Booking).
+Платформа для онлайн-бронювання та продажу квитків на концерти в умовах високої конкуренції за спільні ресурси (High Contention / Flash Crowds). Систему спроєктовано з урахуванням пікових навантажень на старті продажів популярних подій із забезпеченням транзакційної цілісності, захисту від подвійного продажу (Double-Booking) та **горизонтального масштабування (Stateless Architecture)**.
 
 Підтримуються комбіновані типи майданчиків:
-* **Сидячі сектори (Seated):** із фіксованими координатами крісел (ряд, номер місця).
-* **Зони вільного входу (Standing / General Admission):** фан-зони з контролем загальної місткості (Capacity).
+
+- **Сидячі сектори (Seated):** із фіксованими координатами крісел (ряд, номер місця).
+- **Зони вільного входу (Standing / General Admission):** фан-зони з контролем загальної місткості (Capacity).
 
 ---
 
-## 1. Архітектура системи (C4 Container & Component Model)
+## Зміст
+
+1. [Аудит та класифікація стану](#1-аудит-та-класифікація-стану-state-audit-report)
+   - [1.1. Рефакторинг та декомпозиція локального стану](#11-рефакторинг-та-декомпозиція-локального-стану-stateless-architecture)
+   - [1.2. Специфікація Stateless Request Flow](#12-специфікація-stateless-request-flow)
+2. [Архітектура системи](#2-архітектура-системи-c4-container--component-model)
+3. [Схема даних](#3-схема-даних-erd--persistence-layer)
+4. [Специфікація REST API](#4-специфікація-rest-api)
+5. [Матриця відповідальності (RACI)](#5-матриця-відповідальності-raci)
+6. [Інструкція із детермінованого запуску системи](#6-інструкція-із-детермінованого-запуску-системи)
+7. [Результати аналізу вузьких місць](#7-результати-аналізу-вузьких-місць-bottleneck-analysis)
+
+---
+
+## 1. Аудит та класифікація стану (State Audit Report)
+
+Для підготовки backend-сервісу `TicketBooking.Api` до горизонтального масштабування та переведення в безстатусну архітектуру (**Stateless Application Architecture**) було проведено аудит вихідного коду проєкту. Усі компоненти та типи даних, якими оперує сервіс під час обробки запитів, класифіковано за трьома категоріями.
+
+### Таблиця класифікації стану системи
+
+| Категорія стану | Компоненти та елементи коду | Сховище та час життя | Статус та обґрунтування Stateless-придатності |
+|---|---|---|---|
+| **1. Ephemeral / Local Safe**<br/>*(Тимчасовий / локально безпечний)* | • HTTP-контекст запиту (`HttpContext`)<br/>• Вхідні DTO (`CreateBookingRequest`, `ConfirmPaymentRequest`, `RegisterRequest`, `LoginRequest`)<br/>• Локальні стекові змінні методів у контролерах<br/>• Контекст логування (Trace ID, HTTP Request logs) | RAM .NET-процесу<br/>*(Managed Heap, Gen 0 / Stack frame)* | **Безпечно.** Існує виключно протягом обробки одного HTTP-запиту. Автоматично знищується Garbage Collector (GC) після формування відповіді. Не впливає на обробку інших запитів. |
+| **2. Shared / Externalized**<br/>*(Спільний / зовнішній бізнес-стан)* | • Каталог подій, секторів та крісел (`Events`, `Sections`, `SeatSlots`)<br/>• Квитки та їх транзакційні статуси (`Tickets`: `Available`, `Reserved`, `Sold`)<br/>• Бронювання та TTL-резерви (`Bookings`: `Pending`, `Confirmed`, `Expired`, `Cancelled`)<br/>• Користувачі та хеші паролів (`Users`, PBKDF2)<br/>• Сесії та авторизаційні дані | **Primary DB:** PostgreSQL 16<br/>**Distributed Cache:** Redis 7<br/>**Client:** JWT Bearer tokens | **Винесено у зовнішній шар.** Увесь транзакційний та бізнес-стан зберігається в централізованих зовнішніх сховищах. Будь-який інстанс API може прочитати або змінити цей стан через асинхронні запити. |
+| **3. Critical Stateful Dependencies**<br/>*(Критичні stateful-залежності, підлягають вилученню)* | • In-Memory колекції (`List<T>`, `ConcurrentDictionary` для збереження сесій чи броней)<br/>• Local Locks (`lock()`, `SemaphoreSlim` для блокування квитків)<br/>• In-Memory кеш (`IMemoryCache`)<br/>• Локальні лічильники / Singleton state<br/>• Sticky Sessions / Session Cookies | **Пам'ять (RAM) конкретного контейнера/процесу** | **Повністю усунено / відсутні.** Жодні бізнес-дані, прапорці стану або внутрішньопроцесні блокування не зберігаються у пам'яті C#-процесу. Інстанси є 100% взаємозамінними (Interchangeable Workers). |
+
+### Детальний аналіз та докази усунення In-Memory залежностей у коді
+
+1. **Безстатусна автентифікація (Stateless JWT Authentication).**
+   У файлах `AuthController.cs` та `JwtTokenService.cs` авторизація побудована на стандарті RFC 7519 (JWT). Усі дані про користувача зашифровані в підписаному токені (HMAC-SHA256). Сервер не зберігає таблиці активних сесій у локальній пам'яті (`SessionState`). Кожен екземпляр API верифікує токен самостійно за допомогою єдиного ключа `Jwt:Key`, що дозволяє будь-якому інстансу обробити запит `GET /api/v1/auth/me`.
+
+2. **Відмова від Application-Level Locks (`lock` / `SemaphoreSlim`) на користь DB ACID та OCC.**
+   У `BookingsController.cs` під час створення броні не використовуються C#-блокування. Натомість виконується відкриття асинхронної транзакції бази даних `BeginTransactionAsync()` та перевірка токена оптимістичного блокування `Version` (`[ConcurrencyCheck]` на сутності `Ticket`). Захист від Double-Booking працює на рівні PostgreSQL, а не у пам'яті .NET-процесу.
+
+3. **Розподілений фоновий сервіс (`ExpiredBookingsCleaner`).**
+   У файлі `Services/ExpiredBookingsCleaner.cs` фонова задача оновлення прострочених бронювань спирається на прямий SQL-запит до бази даних (`WHERE Status = Pending AND ExpiresAt < UtcNow`). Сервіс не зберігає таймери або списки броней у RAM, спираючись на індекс `IX_Bookings_Status_ExpiresAt`.
+
+4. **Централізований Distributed Cache (Redis 7).**
+   Для зняття навантаження з СУБД під час читання каталогу подій та квитків виконується реєстрація `AddStackExchangeRedisCache` замість `AddMemoryCache`. Інвалідація або оновлення кешу подій на одному з інстансів миттєво відображається для всіх інших вузлів кластера.
+
+---
+
+## 1.1. Рефакторинг та декомпозиція локального стану (Stateless Architecture)
+
+На основі проведеного аудиту було виконано рефакторинг архітектури backend-сервісу `TicketBooking.Api` з дотриманням принципів безстатусності (Stateless Application Architecture).
+
+1. **Забезпечення взаємозамінності вузлів (Interchangeable Workers).**
+   - Усі контролери та сервіси позбавлені локального стану (`static` колекцій, in-memory сесій чи синглтон-прапорців).
+   - Сервіс спирається на безстатусну JWT-автентифікацію (HMAC-SHA256). Будь-який вузол за балансувальником Nginx здатний обробити довільний HTTP-запит, спираючись на стан у PostgreSQL 16 / Redis 7 та заголовок `Authorization: Bearer <token>`.
+
+2. **Декомпозиція та винесення кешу в Redis 7.**
+   - Зареєстровано `AddStackExchangeRedisCache`, що дозволяє винести спільні дані (кеш подій, списки квитків) у зовнішнє key-value сховище `redis:6379`.
+   - Це запобігає асинхронії даних (Stale Data Cache) між різними екземплярами API при оновленні статусів місць.
+
+3. **Розподілена транзакційність та захист від Race Condition.**
+   - Захист від подвійного бронювання (Double-Booking) перенесено на рівень **PostgreSQL ACID-транзакцій** (`BeginTransactionAsync`) та токена оптимістичного блокування **`Version` (OCC)**.
+   - Оскільки перевірка та оновлення статусу квитка є атомарною операцією СУБД, цілісність даних гарантується без використання локальних C#-блокувань (`lock`, `SemaphoreSlim`).
+
+4. **Механізм ідентифікації вузлів (`X-Instance-ID`).**
+   - Впроваджено HTTP Middleware, яке автоматично додає до всіх відповідей заголовок `X-Instance-ID: Environment.MachineName`. Це дозволяє фіксувати конкретний контейнер/вузол, що обробив запит під час балансування Nginx.
+
+---
+
+## 1.2. Специфікація Stateless Request Flow
+
+Для підтвердження безстатусності сервісу було зафіксовано та деталізовано сквозний потік виконання запиту (Request Flow) для ключового бізнес-сценарію — **транзакційне створення бронювання квитків (`POST /api/v1/bookings`)**.
+
+### Схема сквозного потоку (Sequence Diagram)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as Клієнт / Postman
+    participant Nginx as Nginx Balancer (Port 80)
+    participant API1 as Backend Instance 1 (Node A)
+    participant Redis as Redis 7 (Shared Cache)
+    participant Postgres as PostgreSQL 16 (Primary DB)
+    participant API2 as Backend Instance 2 (Node B)
+
+    Note over Client, Nginx: Крок 1: Створення бронювання
+    Client->>Nginx: POST /api/v1/bookings + Bearer JWT
+    Nginx->>API1: Round-Robin проксіювання запиту
+
+    Note over API1: 1. Inbound & Validation<br/>2. Node ID Header (X-Instance-ID: node-a)
+    API1->>Redis: 3. Read Context: Check User Session / Token
+    Redis-->>API1: Session Context Valid
+
+    API1->>Postgres: 4. Read Context: SELECT * FROM Tickets WHERE Id IN (...)
+    Postgres-->>API1: Tickets Found (Status = Available)
+
+    API1->>Postgres: 5. Atomic Mutation: BeginTransactionAsync()
+    API1->>Postgres: UPDATE Tickets SET Status='Reserved', Version=Version+1
+    API1->>Postgres: INSERT INTO Bookings (Status='Pending', ExpiresAt=15m)
+    API1->>Postgres: CommitAsync()
+    Postgres-->>API1: Transaction Committed
+
+    API1-->>Client: 201 Created (X-Instance-ID: node-a, JSON Booking)
+    Note over API1: 6. Zero Memory Retention<br/>(Garbage Collection clears Request Context)
+
+    Note over Client, Nginx: Крок 2: Підтвердження оплати (Interchangeability Test)
+    Client->>Nginx: POST /api/v1/bookings/{id}/confirm + Bearer JWT
+    Nginx->>API2: Round-Robin проксіювання запиту
+
+    Note over API2: 1. Node ID Header (X-Instance-ID: node-b)
+    API2->>Postgres: 2. Read Context: SELECT * FROM Bookings WHERE Id = {id}
+    Postgres-->>API2: Booking Found (Status = Pending, ExpiresAt > UtcNow)
+
+    API2->>Postgres: 3. Atomic Mutation: UPDATE Bookings & Tickets (Status = Sold)
+    API2-->>Client: 200 OK (X-Instance-ID: node-b, Barcodes)
+```
+
+### Фіксація параметрів та дій за вимогами
+
+1. **Вхідні параметри (Inbound Parameters & Token).**
+   - HTTP-маршрут: `POST /api/v1/bookings`
+   - Header: `Authorization: Bearer <jwt_access_token>` (самодостатній токен з `UserId` та `Email`).
+   - Body: `{"userId": "8a7d183f-...", "ticketIds": ["7b0a793c-..."]}`
+
+2. **Вичитування контексту зі Shared Storage.**
+   - Перевірка токена виконується без звернення до локальної пам'яті (криптографічний верифікатор `JwtOptions`).
+   - Читання статусу квитків з **PostgreSQL 16** / **Redis 7** (`SELECT ... FROM Tickets WHERE Id = ANY(@ids)`).
+
+3. **Атомарні зміни стану.**
+   - Відкриття явної транзакції `BeginTransactionAsync()`.
+   - Оновлення статусу квитків із токеном версіонування `Version += 1` (OCC-блокування).
+   - Фіксація броні у СУБД та `CommitAsync()`.
+
+4. **Відсутність залишкових мутацій у пам'яті (Zero Memory Retention).**
+   - Після відправки відповіді `201 Created` усі об'єкти запиту виходять із зони видимості й утилізуються Garbage Collector (GC).
+   - У RAM `Instance 1` не залишається локальних локів або прапорців броні.
+   - Наступний запит `POST /confirm` перенаправляється на `Instance 2`, який зчитує створену бронь напряму з PostgreSQL і успішно завершує оплату.
+
+---
+
+## 2. Архітектура системи (C4 Container & Component Model)
 
 Архітектурна схема системи квиткового бронювання, що відображає мережеву взаємодію, внутрішню компонентну структуру сервісу, первинне сховище даних та інтеграцію із зовнішнім платіжним провайдером.
 
@@ -20,34 +155,34 @@ flowchart TB
     classDef db fill:#2b82c9,stroke:#1168bd,color:#fff;
     classDef ext fill:#888888,stroke:#555555,color:#fff;
 
-    Customer["fa:fa-user **Клієнт**<br/><small>[Person: Web Browser / Mobile App]</small><br/>Переглядає афішу, обирає місця та оплачує квитки"]:::person
+    Customer["<b>Клієнт</b><br/><small>[Person: Web Browser / Mobile App]</small><br/>Переглядає афішу, обирає місця та оплачує квитки"]:::person
 
     subgraph SystemBoundary ["Ticket Booking System [System Boundary]"]
-        
+
         subgraph ApiContainer ["Ticket Booking API (Backend) [Container: ASP.NET Core (.NET 9)]"]
             direction TB
-            Controller["**API Controllers**<br/><small>[Component]</small><br/>EventsController, BookingsController<br/>Маршрутизація та Input Validation"]:::component
-            Service["**Business & Domain Layer**<br/><small>[Component]</small><br/>Холдування місць, логіка TTL резервів,<br/>розрахунок сум замовлень"]:::component
-            DataAccess["**Data Access Layer**<br/><small>[Component: EF Core / Npgsql]</small><br/>Транзакції, оптимістичне блокування,<br/>відображення сутностей"]:::component
+            Controller["<b>API Controllers</b><br/><small>[Component]</small><br/>EventsController, BookingsController<br/>Маршрутизація та Input Validation"]:::component
+            Service["<b>Business & Domain Layer</b><br/><small>[Component]</small><br/>Холдування місць, логіка TTL резервів,<br/>розрахунок сум замовлень"]:::component
+            DataAccess["<b>Data Access Layer</b><br/><small>[Component: EF Core / Npgsql]</small><br/>Транзакції, оптимістичне блокування,<br/>відображення сутностей"]:::component
 
             Controller -->|"Внутрішній виклик (DTO)"| Service
             Service -->|"LINQ / DbContext"| DataAccess
         end
 
-        Db[("fa:fa-database **Primary Database**<br/><small>[Container: PostgreSQL 16]</small><br/>Топологія майданчиків, квитки,<br/>замовлення та користувачі")]:::db
+        Db[("<b>Primary Database</b><br/><small>[Container: PostgreSQL 16]</small><br/>Топологія майданчиків, квитки,<br/>замовлення та користувачі")]:::db
 
     end
 
-    PaymentGateway["fa:fa-credit-card **Payment Gateway**<br/><small>[External System: LiqPay / Stripe API]</small><br/>Обробка безготівкових транзакцій"]:::ext
+    PaymentGateway["<b>Payment Gateway</b><br/><small>[External System: LiqPay / Stripe API]</small><br/>Обробка безготівкових транзакцій"]:::ext
 
     Customer -->|"HTTPS / REST (JSON)<br/>Порти: 80, 443<br/>GET /events, POST /bookings"| Controller
-    DataAccess -->|"TCP / Port 5432 (Npgsql Driver)<br/>Атомарні транзакції, OCC блокування"| Db
+    DataAccess -->|"TCP / Port 5432 (Npgsql Driver)<br/>Атомарні транзакції, OCC-блокування"| Db
     Service -->|"HTTPS / REST (TLS 1.3)<br/>Верифікація оплати замовлення"| PaymentGateway
 ```
 
 ---
 
-## 2. Схема даних (ERD & Persistence Layer)
+## 3. Схема даних (ERD & Persistence Layer)
 
 Модель нормалізована до 3NF. Топологія майданчика (`Venue`, `Section`, `SeatSlot`) строго відділена від комерційних сутностей події (`Event`, `Ticket`), що дозволяє повторно використовувати конфігурацію майданчика для різних концертів без дублювання записів геометрії.
 
@@ -125,23 +260,26 @@ erDiagram
     }
 ```
 
-### Ключові оптимізації бази даних:
-* **Фан-зони:** Для квитків стоячих секторів поле `SeatSlotId` встановлюється в `NULL`, а контроль переповнення виконується на рівні квоти сектора `Section.Capacity`.
-* **Індексація:** Складений індекс `IX_Tickets_EventId_Status` оптимізує фільтрацію доступних квитків під час перегляду схеми залу.
-* **Concurrency Check:** Поле `Version` у сутності `Ticket` реалізує токен оптимістичного блокування (OCC) для контролю паралельного доступу.
-* **TTL резервів:** Індекс `IX_Bookings_Status_ExpiresAt` використовується фоновим сервісом `ExpiredBookingsCleaner`, який кожні 30 с переводить прострочені `Pending`-броні в `Expired` і повертає квитки у продаж.
-* **Унікальність:** `IX_Users_Email` (логін) та `IX_Tickets_Barcode` (штрихкод квитка).
+### Ключові оптимізації бази даних
+
+- **Фан-зони:** для квитків стоячих секторів поле `SeatSlotId` встановлюється в `NULL`, а контроль переповнення виконується на рівні квоти сектора `Section.Capacity`.
+- **Індексація:** складений індекс `IX_Tickets_EventId_Status` оптимізує фільтрацію доступних квитків під час перегляду схеми залу.
+- **Concurrency Check:** поле `Version` у сутності `Ticket` реалізує токен оптимістичного блокування (OCC) для контролю паралельного доступу.
+- **TTL резервів:** індекс `IX_Bookings_Status_ExpiresAt` використовується фоновим сервісом `ExpiredBookingsCleaner`, який кожні 30 с переводить прострочені `Pending`-броні в `Expired` і повертає квитки у продаж.
+- **Унікальність:** `IX_Users_Email` (логін) та `IX_Tickets_Barcode` (штрихкод квитка).
 
 ---
 
-## 3. Специфікація REST API
+## 4. Специфікація REST API
 
 Інтерактивна документація ендпоінтів та тестування доступні через Swagger UI:
-* **Swagger URL:** `http://localhost:5192/swagger`
 
-### Перелік контрактів системи:
+- **Swagger URL:** <http://localhost:5192/swagger>
+
+### Перелік контрактів системи
+
 | Метод | Маршрут | Опис | Відповідає |
-|---|---|---|:---:|
+|---|---|---|---|
 | `GET` | `/api/v1/events` | Отримання каталогу подій з фільтрацією за містом | Катерина |
 | `GET` | `/api/v1/events/{id}/tickets` | Перегляд схеми залу та доступних квитків за подією | Катерина |
 | `POST` | `/api/v1/bookings` | Транзакційне холдування квитків (TTL 15 хв, захист від Race Condition) | Напарник |
@@ -204,31 +342,34 @@ erDiagram
 
 ### Колекція запитів для захисту
 
-* `postman/TicketBooking.postman_collection.json` — імпортувати в Postman (File → Import). Містить 4 папки: сценарій захисту за регламентом, негативні кейси, авторизацію та тест персистентності. ID події/квитків/броней зберігаються у змінні колекції автоматично, кожен запит має автотести (вкладка *Test Results*).
-* `TicketBooking.Api.http` — той самий сценарій для VS Code REST Client / Visual Studio.
+- `postman/TicketBooking.postman_collection.json` — імпортувати в Postman (File → Import). Містить 4 папки: сценарій захисту за регламентом, негативні кейси, авторизацію та тест персистентності. ID події/квитків/броней зберігаються у змінні колекції автоматично, кожен запит має автотести (вкладка *Test Results*).
+- `TicketBooking.Api.http` — той самий сценарій для VS Code REST Client / Visual Studio.
 
 ---
 
-## 4. Матриця відповідальності (RACI)
+## 5. Матриця відповідальності (RACI)
 
-Розподіл інженерних завдань між учасниками команди згідно з вимогами лабораторної роботи:
+Розподіл інженерних завдань між учасниками команди згідно з вимогами лабораторних робіт № 1 та № 2:
 
 | Етап / Модуль розробки | Катерина | Напарник |
-|---|:---:|:---:|
+|---|---|---|
 | **Проєктування домену, структури секторів та ER-моделі** | **A / R** | C |
 | **Шар персистентності (EF Core, Npgsql, DDL, Seeder)** | **A / R** | I |
 | **Модуль каталогу подій (`EventsController`)** | **A / R** | I |
 | **Інтеграція та налаштування OpenAPI / Swagger UI** | **A / R** | I |
-| **Модуль бронювання (`BookingsController`)** | C | **A / R** |
+| **Проведення аудиту стану (State Audit Report) та класифікація за 3 категоріями** | **A / R** | C |
+| **Рефакторинг Stateless Architecture та Middleware `X-Instance-ID`** | **A / R** | I |
+| **Специфікація Stateless Request Flow (Sequence Diagram)** | **A / R** | I |
+| **Модуль бронювання (`BookingsController`) та автентифікації (`AuthController`)** | C | **A / R** |
 | **Input Validation (FluentValidation) та глобальний Middleware помилок** | I | **A / R** |
-| **Контейнеризація: Dockerfile та docker-compose.yml** | I | **A / R** |
+| **Контейнеризація, Nginx Balancer та `docker-compose.yml` (`--scale api=2`)** | I | **A / R** |
+| **Resilience & Cross-Instance Consistency Testing (`docker kill`)** | I | **A / R** |
 | **Аналіз вузьких місць (Bottleneck Analysis за шаблоном)** | C | **A / R** |
 | **Колекція API-запитів (Postman/Bruno з негативними кейсами)** | I | **A / R** |
 
-
 ---
 
-## 5. Інструкція із детермінованого запуску системи
+## 6. Інструкція із детермінованого запуску системи
 
 Потрібні лише Docker та Docker Compose (локальні .NET SDK і PostgreSQL не потрібні). Порти `5432` (PostgreSQL) і `5192` (API) мають бути вільні.
 
@@ -245,25 +386,33 @@ docker compose ps
 docker compose logs api
 ```
 
-* **Swagger UI:** http://localhost:5192/swagger
-* При старті API сам створює схему (`EnsureCreated`) і заповнює тестові дані (див. розділ «Тестові дані»).
-* **Тестовий логін:** `POST /api/v1/auth/login` з `{"email": "katerina@example.com", "password": "Katerina123"}` → JWT; для `GET /api/v1/auth/me` додати заголовок `Authorization: Bearer <token>`.
-* **Postman:** File → Import → `postman/TicketBooking.postman_collection.json`, далі Run collection (папки виконувати по порядку 01 → 02 → 03; змінні зберігаються між запитами).
-* **Newman (CLI):** `npx newman run postman/TicketBooking.postman_collection.json --folder "01 Сценарій захисту (регламент викладача)" --folder "02 Негативні кейси (валідація, 404, 409)" --folder "03 Авторизація (JWT)"`
-* **Скидання бази (чистий стан перед повторним прогоном):**
+- **Swagger UI:** <http://localhost:5192/swagger>
+- При старті API сам створює схему (`EnsureCreated`) і заповнює тестові дані (див. розділ «Тестові дані (seed)»).
+- **Тестовий логін:** `POST /api/v1/auth/login` з `{"email": "katerina@example.com", "password": "Katerina123"}` → JWT; для `GET /api/v1/auth/me` додати заголовок `Authorization: Bearer <token>`.
+- **Postman:** File → Import → `postman/TicketBooking.postman_collection.json`, далі Run collection (папки виконувати по порядку 01 → 02 → 03; змінні зберігаються між запитами).
+- **Newman (CLI):**
 
-```bash
-docker compose down -v && docker compose up -d --build
-```
+  ```bash
+  npx newman run postman/TicketBooking.postman_collection.json \
+    --folder "01 Сценарій захисту (регламент викладача)" \
+    --folder "02 Негативні кейси (валідація, 404, 409)" \
+    --folder "03 Авторизація (JWT)"
+  ```
 
-* **Тест персистентності:** створити бронювання, виконати `docker compose restart db`, дочекатися `healthy` у `docker compose ps` і перевірити `GET /api/v1/bookings/{id}` (статус `Pending`) та `GET /api/v1/events/{eventId}/tickets` (квиток `Reserved`). Дані зберігаються у volume `pgdata`; «мертві» з'єднання в пулі Npgsql після рестарту БД перевіряються й замінюються автоматично (`Infrastructure/PooledConnectionValidator.cs`).
-* **Зупинка:** `docker compose down` (дані зберігаються), `docker compose down -v` (разом з даними).
+- **Скидання бази (чистий стан перед повторним прогоном):**
 
----
+  ```bash
+  docker compose down -v && docker compose up -d --build
+  ```
 
-### Інтеграційні тести
+- **Тест персистентності:** створити бронювання, виконати `docker compose restart db`, дочекатися `healthy` у `docker compose ps` і перевірити `GET /api/v1/bookings/{id}` (статус `Pending`) та `GET /api/v1/events/{eventId}/tickets` (квиток `Reserved`). Дані зберігаються у volume `pgdata`; «мертві» з'єднання в пулі Npgsql після рестарту БД перевіряються й замінюються автоматично (`Infrastructure/PooledConnectionValidator.cs`).
+- **Зупинка:** `docker compose down` (дані зберігаються), `docker compose down -v` (разом з даними).
 
-Проєкт `tests/TicketBooking.IntegrationTests` (xUnit + `WebApplicationFactory` + Testcontainers). Кожен запуск сам піднімає тимчасовий `postgres:16-alpine` у Docker, стартує справжнє API в пам'яті й ганяє запити по HTTP; між тестами база скидається до стану після сідера. Покрито: успішне бронювання, Double-Booking (у т.ч. 20 паралельних запитів → рівно один 201), валідацію (400), 404/409, оплату і штрихкоди, TTL (прострочена бронь → 409, квитки знову Available), скасування, авторизацію (JWT).
+### 6.1. Інтеграційні тести
+
+Проєкт `tests/TicketBooking.IntegrationTests` (xUnit + `WebApplicationFactory` + Testcontainers). Кожен запуск сам піднімає тимчасовий `postgres:16-alpine` у Docker, стартує справжнє API в пам'яті й ганяє запити по HTTP; між тестами база скидається до стану після сідера.
+
+Покрито: успішне бронювання, Double-Booking (у т.ч. 20 паралельних запитів → рівно один `201`), валідацію (`400`), `404`/`409`, оплату і штрихкоди, TTL (прострочена бронь → `409`, квитки знову `Available`), скасування, авторизацію (JWT).
 
 ```bash
 # Варіант 1: повністю в Docker (потрібен лише Docker)
@@ -273,26 +422,29 @@ docker compose --profile tests run --rm tests
 dotnet test tests/TicketBooking.IntegrationTests
 ```
 
-> Варіант 1 збирає проєкт усередині Linux-контейнера й перезаписує `bin/`/`obj/`; перед локальним `dotnet test` може знадобитися `dotnet restore`.
+> **Примітка.** Варіант 1 збирає проєкт усередині Linux-контейнера й перезаписує `bin/`/`obj/`; перед локальним `dotnet test` може знадобитися `dotnet restore`.
 
 ---
 
-## 6. Результати аналізу вузьких місць (Bottleneck Analysis)
+## 7. Результати аналізу вузьких місць (Bottleneck Analysis)
 
-### 1. Row Lock Contention (Транзакційне блокування при купівлі популярних місць)
-* **Точка відмови:** Таблиця `Tickets` під час одночасного виконання транзакцій бронювання (`POST /api/v1/bookings`) за наявності тисяч запитів на обмежений пул квитків.
-* **Причина:** Конкуренція за ексклюзивне блокування рядків у реляційній базі даних. У разі використання песимістичного блокування виникає черга очікування локів (Lock Wait Timeout) і ризик виникнення Deadlock.
-* **Вплив:** Різке зростання $p99$ затримки відповіді з <100 мс до кількох секунд, масові помилки `504 Gateway Timeout` та `409 Conflict`.
-* **Шляхи оптимізації:** Використання черги повідомлень (RabbitMQ/Kafka) для серіалізації запитів на бронювання або застосування In-Memory сховища (Redis) з атомарними операціями через Lua-скрипти перед записом у реляційну БД.
+### 7.1. Row Lock Contention (транзакційне блокування при купівлі популярних місць)
 
-### 2. Database Connection Pool Exhaustion (Вичерпання пулу з'єднань БД)
-* **Точка відмови:** Пул підключень Npgsql / PostgreSQL (`Max Pool Size`).
-* **Причина:** Під час сплеску трафіку (Flash Crowd) кількість одночасних HTTP-запитів значно перевищує ліміт пулу з'єднань до бази даних (за замовчуванням 100 підключень).
-* **Вплив:** Потоки ASP.NET Core блокуються в очікуванні вільного підключення з пулу, що призводить до вичерпання пулу потоків веб-сервера (Thread Pool Starvation) і відмови всього API.
-* **Шляхи оптимізації:** Впровадження connection pooler (PgBouncer) на рівні інфраструктури, агресивне кешування незмінних даних (каталог подій, геометрія залу) на рівні Redis/CDN, скорочення часу утримання відкритих транзакцій до мінімуму.
+- **Точка відмови:** таблиця `Tickets` під час одночасного виконання транзакцій бронювання (`POST /api/v1/bookings`) за наявності тисяч запитів на обмежений пул квитків.
+- **Причина:** конкуренція за ексклюзивне блокування рядків у реляційній базі даних. У разі використання песимістичного блокування виникає черга очікування локів (Lock Wait Timeout) і ризик виникнення Deadlock.
+- **Вплив:** різке зростання p99-затримки відповіді з <100 мс до кількох секунд, масові помилки `504 Gateway Timeout` та `409 Conflict`.
+- **Шляхи оптимізації:** використання черги повідомлень (RabbitMQ/Kafka) для серіалізації запитів на бронювання або застосування in-memory сховища (Redis) з атомарними операціями через Lua-скрипти перед записом у реляційну БД.
 
-### 3. Read Amplification & I/O Overhead при читанні схеми залу
-* **Точка відмови:** Дискова підсистема СУБД (Disk I/O) під час масового опитування схеми квитків (`GET /api/v1/events/{id}/tickets`).
-* **Причина:** Користувачі постійно оновлюють сторінку вибору місць, генеруючи важкі `SELECT`-запити з `JOIN` до таблиць `Sections`, `SeatSlots` і `Tickets`.
-* **Вплив:** Вичерпання буферного пулу PostgreSQL (`shared_buffers`), зростання черги читання з диска, деградація продуктивності всієї системи.
-* **Шляхи оптимізації:** Використання HTTP-кешування з заголовками `ETag` / `If-None-Match`, оновлення стану зайнятих місць на клієнті через Server-Sent Events (SSE) або WebSockets замість частих опитувань (polling).
+### 7.2. Database Connection Pool Exhaustion (вичерпання пулу з'єднань БД)
+
+- **Точка відмови:** пул підключень Npgsql / PostgreSQL (`Max Pool Size`).
+- **Причина:** під час сплеску трафіку (Flash Crowd) кількість одночасних HTTP-запитів значно перевищує ліміт пулу з'єднань до бази даних (за замовчуванням 100 підключень).
+- **Вплив:** потоки ASP.NET Core блокуються в очікуванні вільного підключення з пулу, що призводить до вичерпання пулу потоків веб-сервера (Thread Pool Starvation) і відмови всього API.
+- **Шляхи оптимізації:** впровадження connection pooler (PgBouncer) на рівні інфраструктури, агресивне кешування незмінних даних (каталог подій, геометрія залу) на рівні Redis/CDN, скорочення часу утримання відкритих транзакцій до мінімуму.
+
+### 7.3. Read Amplification & I/O Overhead при читанні схеми залу
+
+- **Точка відмови:** дискова підсистема СУБД (Disk I/O) під час масового опитування схеми квитків (`GET /api/v1/events/{id}/tickets`).
+- **Причина:** користувачі постійно оновлюють сторінку вибору місць, генеруючи важкі `SELECT`-запити з `JOIN` до таблиць `Sections`, `SeatSlots` і `Tickets`.
+- **Вплив:** вичерпання буферного пулу PostgreSQL (`shared_buffers`), зростання черги читання з диска, деградація продуктивності всієї системи.
+- **Шляхи оптимізації:** використання HTTP-кешування із заголовками `ETag` / `If-None-Match`, оновлення стану зайнятих місць на клієнті через Server-Sent Events (SSE) або WebSockets замість частих опитувань (polling).
