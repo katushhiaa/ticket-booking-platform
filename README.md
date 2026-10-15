@@ -32,7 +32,7 @@
 | Категорія стану | Компоненти та елементи коду | Сховище та час життя | Статус та обґрунтування Stateless-придатності |
 |---|---|---|---|
 | **1. Ephemeral / Local Safe**<br/>*(Тимчасовий / локально безпечний)* | • HTTP-контекст запиту (`HttpContext`)<br/>• Вхідні DTO (`CreateBookingRequest`, `ConfirmPaymentRequest`, `RegisterRequest`, `LoginRequest`)<br/>• Локальні стекові змінні методів у контролерах<br/>• Контекст логування (Trace ID, HTTP Request logs) | RAM .NET-процесу<br/>*(Managed Heap, Gen 0 / Stack frame)* | **Безпечно.** Існує виключно протягом обробки одного HTTP-запиту. Автоматично знищується Garbage Collector (GC) після формування відповіді. Не впливає на обробку інших запитів. |
-| **2. Shared / Externalized**<br/>*(Спільний / зовнішній бізнес-стан)* | • Каталог подій, секторів та крісел (`Events`, `Sections`, `SeatSlots`)<br/>• Квитки та їх транзакційні статуси (`Tickets`: `Available`, `Reserved`, `Sold`)<br/>• Бронювання та TTL-резерви (`Bookings`: `Pending`, `Confirmed`, `Expired`, `Cancelled`)<br/>• Користувачі та хеші паролів (`Users`, PBKDF2)<br/>• Сесії та авторизаційні дані | **Primary DB:** PostgreSQL 16<br/>**Distributed Cache:** Redis 7<br/>**Client:** JWT Bearer tokens | **Винесено у зовнішній шар.** Увесь транзакційний та бізнес-стан зберігається в централізованих зовнішніх сховищах. Будь-який інстанс API може прочитати або змінити цей стан через асинхронні запити. |
+| **2. Shared / Externalized**<br/>*(Спільний / зовнішній бізнес-стан)* | • Каталог подій, секторів та крісел (`Events`, `Sections`, `SeatSlots`)<br/>• Квитки та їх транзакційні статуси (`Tickets`: `Available`, `Reserved`, `Sold`)<br/>• Бронювання та TTL-резерви (`Bookings`: `Pending`, `Confirmed`, `Expired`, `Cancelled`)<br/>• Користувачі та хеші паролів (`Users`, PBKDF2)<br/>• Сесії та авторизаційні дані | **Primary DB:** PostgreSQL 16<br/>**Distributed Cache (каталог подій):** Redis 7<br/>**Client:** JWT Bearer tokens | **Винесено у зовнішній шар.** Увесь транзакційний та бізнес-стан зберігається в централізованих зовнішніх сховищах. Будь-який інстанс API може прочитати або змінити цей стан через асинхронні запити. |
 | **3. Critical Stateful Dependencies**<br/>*(Критичні stateful-залежності, підлягають вилученню)* | • In-Memory колекції (`List<T>`, `ConcurrentDictionary` для збереження сесій чи броней)<br/>• Local Locks (`lock()`, `SemaphoreSlim` для блокування квитків)<br/>• In-Memory кеш (`IMemoryCache`)<br/>• Локальні лічильники / Singleton state<br/>• Sticky Sessions / Session Cookies | **Пам'ять (RAM) конкретного контейнера/процесу** | **Повністю усунено / відсутні.** Жодні бізнес-дані, прапорці стану або внутрішньопроцесні блокування не зберігаються у пам'яті C#-процесу. Інстанси є 100% взаємозамінними (Interchangeable Workers). |
 
 ### Детальний аналіз та докази усунення In-Memory залежностей у коді
@@ -47,7 +47,7 @@
    У файлі `Services/ExpiredBookingsCleaner.cs` фонова задача оновлення прострочених бронювань спирається на прямий SQL-запит до бази даних (`WHERE Status = Pending AND ExpiresAt < UtcNow`). Сервіс не зберігає таймери або списки броней у RAM, спираючись на індекс `IX_Bookings_Status_ExpiresAt`.
 
 4. **Централізований Distributed Cache (Redis 7).**
-   Для зняття навантаження з СУБД під час читання каталогу подій та квитків виконується реєстрація `AddStackExchangeRedisCache` замість `AddMemoryCache`. Інвалідація або оновлення кешу подій на одному з інстансів миттєво відображається для всіх інших вузлів кластера.
+   Каталог подій (`GET /api/v1/events`) кешується в Redis через `IDistributedCache` на 60 с (ключ `events:{city|all}`). Кеш спільний для всіх інстансів, тому запис з одного вузла видно на інших. Квитки кешем не є: їхній статус змінюється при кожному бронюванні, тож `GET /events/{id}/tickets` читається з PostgreSQL. Якщо Redis недоступний, каталог віддається з БД (збій кешу не валить API).
 
 ---
 
@@ -57,11 +57,11 @@
 
 1. **Забезпечення взаємозамінності вузлів (Interchangeable Workers).**
    - Усі контролери та сервіси позбавлені локального стану (`static` колекцій, in-memory сесій чи синглтон-прапорців).
-   - Сервіс спирається на безстатусну JWT-автентифікацію (HMAC-SHA256). Будь-який вузол за балансувальником Nginx здатний обробити довільний HTTP-запит, спираючись на стан у PostgreSQL 16 / Redis 7 та заголовок `Authorization: Bearer <token>`.
+   - Сервіс спирається на безстатусну JWT-автентифікацію (HMAC-SHA256). Будь-який вузол за балансувальником Nginx здатний обробити довільний HTTP-запит, спираючись на стан у PostgreSQL 16 та заголовок `Authorization: Bearer <token>`. Redis використовується лише як кеш каталогу подій, а не як сховище сесій.
 
 2. **Декомпозиція та винесення кешу в Redis 7.**
-   - Зареєстровано `AddStackExchangeRedisCache`, що дозволяє винести спільні дані (кеш подій, списки квитків) у зовнішнє key-value сховище `redis:6379`.
-   - Це запобігає асинхронії даних (Stale Data Cache) між різними екземплярами API при оновленні статусів місць.
+   - Зареєстровано `AddStackExchangeRedisCache`; каталог подій кешується у зовнішньому сховищі `redis:6379` з TTL 60 с.
+   - Статуси квитків і місць Redis не кешує, щоб уникнути застарілих даних (Stale Data Cache) при бронюванні; вони завжди читаються з PostgreSQL.
 
 3. **Розподілена транзакційність та захист від Race Condition.**
    - Захист від подвійного бронювання (Double-Booking) перенесено на рівень **PostgreSQL ACID-транзакцій** (`BeginTransactionAsync`) та токена оптимістичного блокування **`Version` (OCC)**.
@@ -84,7 +84,7 @@ sequenceDiagram
     actor Client as Клієнт / Postman
     participant Nginx as Nginx Balancer (Port 80)
     participant API1 as Backend Instance 1 (Node A)
-    participant Redis as Redis 7 (Shared Cache)
+    participant Redis as Redis 7 (Catalog Cache)
     participant Postgres as PostgreSQL 16 (Primary DB)
     participant API2 as Backend Instance 2 (Node B)
 
@@ -93,8 +93,7 @@ sequenceDiagram
     Nginx->>API1: Round-Robin проксіювання запиту
 
     Note over API1: 1. Inbound & Validation<br/>2. Node ID Header (X-Instance-ID: node-a)
-    API1->>Redis: 3. Read Context: Check User Session / Token
-    Redis-->>API1: Session Context Valid
+    Note over API1: 3. Перевірка JWT-підпису (HMAC-SHA256),<br/>без звернення до Redis
 
     API1->>Postgres: 4. Read Context: SELECT * FROM Tickets WHERE Id IN (...)
     Postgres-->>API1: Tickets Found (Status = Available)
@@ -129,7 +128,7 @@ sequenceDiagram
 
 2. **Вичитування контексту зі Shared Storage.**
    - Перевірка токена виконується без звернення до локальної пам'яті (криптографічний верифікатор `JwtOptions`).
-   - Читання статусу квитків з **PostgreSQL 16** / **Redis 7** (`SELECT ... FROM Tickets WHERE Id = ANY(@ids)`).
+   - Читання статусу квитків з **PostgreSQL 16** (`SELECT ... FROM Tickets WHERE Id = ANY(@ids)`). Redis на цьому кроці не використовується.
 
 3. **Атомарні зміни стану.**
    - Відкриття явної транзакції `BeginTransactionAsync()`.
@@ -145,7 +144,7 @@ sequenceDiagram
 
 ## 2. Архітектура системи (C4 Container & Component Model)
 
-Архітектурна схема системи квиткового бронювання, що відображає мережеву взаємодію, внутрішню компонентну структуру сервісу, первинне сховище даних та інтеграцію із зовнішнім платіжним провайдером.
+Архітектурна схема з кількома інстансами API за балансувальником Nginx (Round-Robin, без sticky sessions). Усі інстанси ходять у спільний PostgreSQL 16 (бізнес-стан) і Redis 7 (розподілений кеш); жодного стану в пам'яті контейнера немає, тому будь-який інстанс може обробити будь-який запит.
 
 ```mermaid
 flowchart TB
@@ -153,34 +152,46 @@ flowchart TB
     classDef container fill:#1168bd,stroke:#0e5296,color:#fff;
     classDef component fill:#1f77b4,stroke:#0e5296,color:#fff;
     classDef db fill:#2b82c9,stroke:#1168bd,color:#fff;
+    classDef infra fill:#6c757d,stroke:#495057,color:#fff;
     classDef ext fill:#888888,stroke:#555555,color:#fff;
 
     Customer["<b>Клієнт</b><br/><small>[Person: Web Browser / Mobile App]</small><br/>Переглядає афішу, обирає місця та оплачує квитки"]:::person
 
     subgraph SystemBoundary ["Ticket Booking System [System Boundary]"]
 
-        subgraph ApiContainer ["Ticket Booking API (Backend) [Container: ASP.NET Core (.NET 9)]"]
-            direction TB
-            Controller["<b>API Controllers</b><br/><small>[Component]</small><br/>EventsController, BookingsController<br/>Маршрутизація та Input Validation"]:::component
-            Service["<b>Business & Domain Layer</b><br/><small>[Component]</small><br/>Холдування місць, логіка TTL резервів,<br/>розрахунок сум замовлень"]:::component
-            DataAccess["<b>Data Access Layer</b><br/><small>[Component: EF Core / Npgsql]</small><br/>Транзакції, оптимістичне блокування,<br/>відображення сутностей"]:::component
+        Nginx["<b>Nginx Load Balancer</b><br/><small>[Container: nginx:1.27, порт 80]</small><br/>Round-Robin, без sticky sessions"]:::infra
 
-            Controller -->|"Внутрішній виклик (DTO)"| Service
-            Service -->|"LINQ / DbContext"| DataAccess
+        subgraph ApiCluster ["Ticket Booking API [Container: ASP.NET Core (.NET 9), replicas: 2]"]
+            direction TB
+            subgraph Node1 ["Instance 1 (ticket-booking-api-1)"]
+                Ctrl1["<b>API Controllers</b><br/><small>[Component]</small><br/>Events, Bookings, Auth"]:::component
+                Svc1["<b>Business & Domain Layer</b><br/><small>[Component]</small><br/>TTL резервів, холдування квитків"]:::component
+            end
+            subgraph Node2 ["Instance 2 (ticket-booking-api-2)"]
+                Ctrl2["<b>API Controllers</b><br/><small>[Component]</small><br/>Events, Bookings, Auth"]:::component
+                Svc2["<b>Business & Domain Layer</b><br/><small>[Component]</small><br/>TTL резервів, холдування квитків"]:::component
+            end
         end
 
-        Db[("<b>Primary Database</b><br/><small>[Container: PostgreSQL 16]</small><br/>Топологія майданчиків, квитки,<br/>замовлення та користувачі")]:::db
+        Db[("<b>Primary Database</b><br/><small>[Container: PostgreSQL 16]</small><br/>Події, квитки, бронювання,<br/>користувачі (спільний стан)")]:::db
+        Redis[("<b>Distributed Cache</b><br/><small>[Container: Redis 7]</small><br/>Кеш каталогу подій, спільний для інстансів")]:::db
 
     end
 
     PaymentGateway["<b>Payment Gateway</b><br/><small>[External System: LiqPay / Stripe API]</small><br/>Обробка безготівкових транзакцій"]:::ext
 
-    Customer -->|"HTTPS / REST (JSON)<br/>Порти: 80, 443<br/>GET /events, POST /bookings"| Controller
-    DataAccess -->|"TCP / Port 5432 (Npgsql Driver)<br/>Атомарні транзакції, OCC-блокування"| Db
-    Service -->|"HTTPS / REST (TLS 1.3)<br/>Верифікація оплати замовлення"| PaymentGateway
+    Customer -->|"HTTP / REST (JSON), JWT<br/>http://localhost (порт 80)"| Nginx
+    Nginx -->|"Round-Robin"| Ctrl1
+    Nginx -->|"Round-Robin"| Ctrl2
+    Ctrl1 --> Svc1
+    Ctrl2 --> Svc2
+    Svc1 -->|"TCP 5432 (Npgsql), OCC + транзакції"| Db
+    Svc2 -->|"TCP 5432 (Npgsql), OCC + транзакції"| Db
+    Svc1 -->|"TCP 6379 (кеш каталогу подій, TTL 60 с)"| Redis
+    Svc2 -->|"TCP 6379 (кеш каталогу подій, TTL 60 с)"| Redis
+    Svc1 -->|"HTTPS / REST (TLS 1.3)<br/>Верифікація оплати"| PaymentGateway
+    Svc2 -->|"HTTPS / REST (TLS 1.3)<br/>Верифікація оплати"| PaymentGateway
 ```
-
----
 
 ## 3. Схема даних (ERD & Persistence Layer)
 
@@ -274,7 +285,7 @@ erDiagram
 
 Інтерактивна документація ендпоінтів та тестування доступні через Swagger UI:
 
-- **Swagger URL:** <http://localhost:5192/swagger>
+- **Swagger URL:** <http://localhost/swagger> (через Nginx)
 
 ### Перелік контрактів системи
 
@@ -371,32 +382,40 @@ erDiagram
 
 ## 6. Інструкція із детермінованого запуску системи
 
-Потрібні лише Docker та Docker Compose (локальні .NET SDK і PostgreSQL не потрібні). Порти `5432` (PostgreSQL) і `5192` (API) мають бути вільні.
+Потрібні лише Docker та Docker Compose (локальні .NET SDK, PostgreSQL і Redis не потрібні). Порти `80` (Nginx) і `5432` (PostgreSQL) мають бути вільні.
 
 ```bash
 # 1. Клонування репозиторію
 git clone https://github.com/katushhiaa/ticket-booking-platform.git
 cd ticket-booking-platform
 
-# 2. Збірка і запуск (PostgreSQL + API)
-docker compose up -d --build
+# 2. Збірка і запуск: PostgreSQL 16, Redis 7, 2 інстанси API та Nginx
+docker compose up -d --build --scale api=2
 
-# 3. Перевірка статусу: db має бути healthy, api — Up
+# 3. Перевірка статусу: db і redis — healthy; api-1, api-2, nginx — Up
 docker compose ps
 docker compose logs api
 ```
 
-- **Swagger UI:** <http://localhost:5192/swagger>
+- **Топологія:** клієнт → Nginx (`http://localhost`, порт 80) → `api` (2 репліки, Round-Robin) → спільні PostgreSQL та Redis. Порт API напряму назовні не публікується: усі запити йдуть через Nginx.
+- **Перевірка балансування:** кожна відповідь містить заголовок `X-Instance-ID` (ID контейнера, що обробив запит). Послідовні запити до `http://localhost/api/v1/events` мають чергувати два різні значення:
+
+  ```bash
+  for i in 1 2 3 4; do curl -s -D - -o /dev/null http://localhost/api/v1/events | grep -i x-instance-id; done
+  ```
+
+- **Swagger UI:** <http://localhost/swagger>
 - При старті API сам створює схему (`EnsureCreated`) і заповнює тестові дані (див. розділ «Тестові дані (seed)»).
 - **Тестовий логін:** `POST /api/v1/auth/login` з `{"email": "katerina@example.com", "password": "Katerina123"}` → JWT; для `GET /api/v1/auth/me` додати заголовок `Authorization: Bearer <token>`.
-- **Postman:** File → Import → `postman/TicketBooking.postman_collection.json`, далі Run collection (папки виконувати по порядку 01 → 02 → 03; змінні зберігаються між запитами).
+- **Postman:** File → Import → `postman/TicketBooking.postman_collection.json`, далі Run collection (папки виконувати по порядку 01 → 02 → 03 → 05; змінні зберігаються між запитами). Колекційний тест перевіряє `X-Instance-ID` у кожній відповіді.
 - **Newman (CLI):**
 
   ```bash
   npx newman run postman/TicketBooking.postman_collection.json \
     --folder "01 Сценарій захисту (регламент викладача)" \
     --folder "02 Негативні кейси (валідація, 404, 409)" \
-    --folder "03 Авторизація (JWT)"
+    --folder "03 Авторизація (JWT)" \
+    --folder "05 Cross-Instance (2 репліки за Nginx)"
   ```
 
 - **Скидання бази (чистий стан перед повторним прогоном):**
@@ -406,6 +425,8 @@ docker compose logs api
   ```
 
 - **Тест персистентності:** створити бронювання, виконати `docker compose restart db`, дочекатися `healthy` у `docker compose ps` і перевірити `GET /api/v1/bookings/{id}` (статус `Pending`) та `GET /api/v1/events/{eventId}/tickets` (квиток `Reserved`). Дані зберігаються у volume `pgdata`; «мертві» з'єднання в пулі Npgsql після рестарту БД перевіряються й замінюються автоматично (`Infrastructure/PooledConnectionValidator.cs`).
+- **Сценарій А (Cross-Instance Consistency):** логін → створення броні → перегляд → оплата. Запити обробляють різні інстанси (`X-Instance-ID` у відповідях), але стан однаковий: броня, створена на одному вузлі, видна і підтверджується на іншому. Папка `05` у Postman робить це автоматично.
+- **Сценарій Б (Instance Loss):** створити бронь, знайти інстанс, що її обробив, вбити його `docker kill ticket-booking-api-1`, одразу підтвердити оплату. Запит проходить через уцілілий `api-2`, квиток стає `Sold`. Вбитий контейнер Docker сам не піднімає (ручна зупинка вимикає `restart`), тому повернути другу репліку можна так: `docker compose up -d --scale api=2`.
 - **Зупинка:** `docker compose down` (дані зберігаються), `docker compose down -v` (разом з даними).
 
 ### 6.1. Інтеграційні тести
