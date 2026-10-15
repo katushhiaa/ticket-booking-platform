@@ -4,6 +4,7 @@ using FluentValidation;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using TicketBooking.Api.Auth;
@@ -144,11 +145,23 @@ app.UseExceptionHandler();
 // Порожні 404/405/401 теж віддаються як ProblemDetails
 app.UseStatusCodePages();
 
+// Кілька інстансів стартують одночасно (docker compose --scale api=2), тому схему і сідинг
+// серіалізуємо advisory lock-ом PostgreSQL: інакше два процеси одночасно створять таблиці/дані.
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    db.Database.EnsureCreated();
-    DbSeeder.SeedInitialData(db);
+    await using var lockConnection = new NpgsqlConnection(db.Database.GetConnectionString());
+    await lockConnection.OpenAsync();
+    await new NpgsqlCommand("SELECT pg_advisory_lock(20260001)", lockConnection).ExecuteNonQueryAsync();
+    try
+    {
+        db.Database.EnsureCreated();
+        DbSeeder.SeedInitialData(db);
+    }
+    finally
+    {
+        await new NpgsqlCommand("SELECT pg_advisory_unlock(20260001)", lockConnection).ExecuteNonQueryAsync();
+    }
 }
 
 // Swagger доступний завжди (навчальний проєкт, потрібен і в Docker)

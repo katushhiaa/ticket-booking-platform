@@ -1,7 +1,7 @@
 ### Ticket Booking API — сценарій захисту
 ### Формат: VS Code REST Client / Visual Studio 2022 (17.12+). Повна версія з автотестами — postman/TicketBooking.postman_collection.json
 
-@baseUrl = http://localhost:5192
+@baseUrl = http://localhost
 @userId = 8a7d183f-6712-401c-b26a-9f5e13d1fa82
 @eventId = e5b87192-3c2b-4d43-9821-82d2cbb54d01
 

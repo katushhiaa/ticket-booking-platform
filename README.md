@@ -145,7 +145,7 @@ sequenceDiagram
 
 ## 2. Архітектура системи (C4 Container & Component Model)
 
-Архітектурна схема системи квиткового бронювання, що відображає мережеву взаємодію, внутрішню компонентну структуру сервісу, первинне сховище даних та інтеграцію із зовнішнім платіжним провайдером.
+Архітектурна схема з кількома інстансами API за балансувальником Nginx (Round-Robin, без sticky sessions). Усі інстанси ходять у спільний PostgreSQL 16 (бізнес-стан) і Redis 7 (розподілений кеш); жодного стану в пам'яті контейнера немає, тому будь-який інстанс може обробити будь-який запит.
 
 ```mermaid
 flowchart TB
@@ -153,34 +153,46 @@ flowchart TB
     classDef container fill:#1168bd,stroke:#0e5296,color:#fff;
     classDef component fill:#1f77b4,stroke:#0e5296,color:#fff;
     classDef db fill:#2b82c9,stroke:#1168bd,color:#fff;
+    classDef infra fill:#6c757d,stroke:#495057,color:#fff;
     classDef ext fill:#888888,stroke:#555555,color:#fff;
 
     Customer["<b>Клієнт</b><br/><small>[Person: Web Browser / Mobile App]</small><br/>Переглядає афішу, обирає місця та оплачує квитки"]:::person
 
     subgraph SystemBoundary ["Ticket Booking System [System Boundary]"]
 
-        subgraph ApiContainer ["Ticket Booking API (Backend) [Container: ASP.NET Core (.NET 9)]"]
-            direction TB
-            Controller["<b>API Controllers</b><br/><small>[Component]</small><br/>EventsController, BookingsController<br/>Маршрутизація та Input Validation"]:::component
-            Service["<b>Business & Domain Layer</b><br/><small>[Component]</small><br/>Холдування місць, логіка TTL резервів,<br/>розрахунок сум замовлень"]:::component
-            DataAccess["<b>Data Access Layer</b><br/><small>[Component: EF Core / Npgsql]</small><br/>Транзакції, оптимістичне блокування,<br/>відображення сутностей"]:::component
+        Nginx["<b>Nginx Load Balancer</b><br/><small>[Container: nginx:1.27, порт 80]</small><br/>Round-Robin, без sticky sessions"]:::infra
 
-            Controller -->|"Внутрішній виклик (DTO)"| Service
-            Service -->|"LINQ / DbContext"| DataAccess
+        subgraph ApiCluster ["Ticket Booking API [Container: ASP.NET Core (.NET 9), replicas: 2]"]
+            direction TB
+            subgraph Node1 ["Instance 1 (ticket-booking-api-1)"]
+                Ctrl1["<b>API Controllers</b><br/><small>[Component]</small><br/>Events, Bookings, Auth"]:::component
+                Svc1["<b>Business & Domain Layer</b><br/><small>[Component]</small><br/>TTL резервів, холдування квитків"]:::component
+            end
+            subgraph Node2 ["Instance 2 (ticket-booking-api-2)"]
+                Ctrl2["<b>API Controllers</b><br/><small>[Component]</small><br/>Events, Bookings, Auth"]:::component
+                Svc2["<b>Business & Domain Layer</b><br/><small>[Component]</small><br/>TTL резервів, холдування квитків"]:::component
+            end
         end
 
-        Db[("<b>Primary Database</b><br/><small>[Container: PostgreSQL 16]</small><br/>Топологія майданчиків, квитки,<br/>замовлення та користувачі")]:::db
+        Db[("<b>Primary Database</b><br/><small>[Container: PostgreSQL 16]</small><br/>Події, квитки, бронювання,<br/>користувачі (спільний стан)")]:::db
+        Redis[("<b>Distributed Cache</b><br/><small>[Container: Redis 7]</small><br/>Спільний кеш для всіх інстансів")]:::db
 
     end
 
     PaymentGateway["<b>Payment Gateway</b><br/><small>[External System: LiqPay / Stripe API]</small><br/>Обробка безготівкових транзакцій"]:::ext
 
-    Customer -->|"HTTPS / REST (JSON)<br/>Порти: 80, 443<br/>GET /events, POST /bookings"| Controller
-    DataAccess -->|"TCP / Port 5432 (Npgsql Driver)<br/>Атомарні транзакції, OCC-блокування"| Db
-    Service -->|"HTTPS / REST (TLS 1.3)<br/>Верифікація оплати замовлення"| PaymentGateway
+    Customer -->|"HTTP / REST (JSON), JWT<br/>http://localhost (порт 80)"| Nginx
+    Nginx -->|"Round-Robin"| Ctrl1
+    Nginx -->|"Round-Robin"| Ctrl2
+    Ctrl1 --> Svc1
+    Ctrl2 --> Svc2
+    Svc1 -->|"TCP 5432 (Npgsql), OCC + транзакції"| Db
+    Svc2 -->|"TCP 5432 (Npgsql), OCC + транзакції"| Db
+    Svc1 -->|"TCP 6379 (кеш подій/квитків)"| Redis
+    Svc2 -->|"TCP 6379 (кеш подій/квитків)"| Redis
+    Svc1 -->|"HTTPS / REST (TLS 1.3)<br/>Верифікація оплати"| PaymentGateway
+    Svc2 -->|"HTTPS / REST (TLS 1.3)<br/>Верифікація оплати"| PaymentGateway
 ```
-
----
 
 ## 3. Схема даних (ERD & Persistence Layer)
 
@@ -274,7 +286,7 @@ erDiagram
 
 Інтерактивна документація ендпоінтів та тестування доступні через Swagger UI:
 
-- **Swagger URL:** <http://localhost:5192/swagger>
+- **Swagger URL:** <http://localhost/swagger> (через Nginx)
 
 ### Перелік контрактів системи
 
@@ -371,32 +383,40 @@ erDiagram
 
 ## 6. Інструкція із детермінованого запуску системи
 
-Потрібні лише Docker та Docker Compose (локальні .NET SDK і PostgreSQL не потрібні). Порти `5432` (PostgreSQL) і `5192` (API) мають бути вільні.
+Потрібні лише Docker та Docker Compose (локальні .NET SDK, PostgreSQL і Redis не потрібні). Порти `80` (Nginx) і `5432` (PostgreSQL) мають бути вільні.
 
 ```bash
 # 1. Клонування репозиторію
 git clone https://github.com/katushhiaa/ticket-booking-platform.git
 cd ticket-booking-platform
 
-# 2. Збірка і запуск (PostgreSQL + API)
-docker compose up -d --build
+# 2. Збірка і запуск: PostgreSQL 16, Redis 7, 2 інстанси API та Nginx
+docker compose up -d --build --scale api=2
 
-# 3. Перевірка статусу: db має бути healthy, api — Up
+# 3. Перевірка статусу: db і redis — healthy; api-1, api-2, nginx — Up
 docker compose ps
 docker compose logs api
 ```
 
-- **Swagger UI:** <http://localhost:5192/swagger>
+- **Топологія:** клієнт → Nginx (`http://localhost`, порт 80) → `api` (2 репліки, Round-Robin) → спільні PostgreSQL та Redis. Порт API напряму назовні не публікується: усі запити йдуть через Nginx.
+- **Перевірка балансування:** кожна відповідь містить заголовок `X-Instance-ID` (ID контейнера, що обробив запит). Послідовні запити до `http://localhost/api/v1/events` мають чергувати два різні значення:
+
+  ```bash
+  for i in 1 2 3 4; do curl -s -D - -o /dev/null http://localhost/api/v1/events | grep -i x-instance-id; done
+  ```
+
+- **Swagger UI:** <http://localhost/swagger>
 - При старті API сам створює схему (`EnsureCreated`) і заповнює тестові дані (див. розділ «Тестові дані (seed)»).
 - **Тестовий логін:** `POST /api/v1/auth/login` з `{"email": "katerina@example.com", "password": "Katerina123"}` → JWT; для `GET /api/v1/auth/me` додати заголовок `Authorization: Bearer <token>`.
-- **Postman:** File → Import → `postman/TicketBooking.postman_collection.json`, далі Run collection (папки виконувати по порядку 01 → 02 → 03; змінні зберігаються між запитами).
+- **Postman:** File → Import → `postman/TicketBooking.postman_collection.json`, далі Run collection (папки виконувати по порядку 01 → 02 → 03 → 05; змінні зберігаються між запитами). Колекційний тест перевіряє `X-Instance-ID` у кожній відповіді.
 - **Newman (CLI):**
 
   ```bash
   npx newman run postman/TicketBooking.postman_collection.json \
     --folder "01 Сценарій захисту (регламент викладача)" \
     --folder "02 Негативні кейси (валідація, 404, 409)" \
-    --folder "03 Авторизація (JWT)"
+    --folder "03 Авторизація (JWT)" \
+    --folder "05 Cross-Instance (2 репліки за Nginx)"
   ```
 
 - **Скидання бази (чистий стан перед повторним прогоном):**
@@ -406,6 +426,8 @@ docker compose logs api
   ```
 
 - **Тест персистентності:** створити бронювання, виконати `docker compose restart db`, дочекатися `healthy` у `docker compose ps` і перевірити `GET /api/v1/bookings/{id}` (статус `Pending`) та `GET /api/v1/events/{eventId}/tickets` (квиток `Reserved`). Дані зберігаються у volume `pgdata`; «мертві» з'єднання в пулі Npgsql після рестарту БД перевіряються й замінюються автоматично (`Infrastructure/PooledConnectionValidator.cs`).
+- **Сценарій А (Cross-Instance Consistency):** логін → створення броні → перегляд → оплата. Запити обробляють різні інстанси (`X-Instance-ID` у відповідях), але стан однаковий: броня, створена на одному вузлі, видна і підтверджується на іншому. Папка `05` у Postman робить це автоматично.
+- **Сценарій Б (Instance Loss):** створити бронь, знайти інстанс, що її обробив, вбити його `docker kill ticket-booking-api-1`, одразу підтвердити оплату. Запит проходить через уцілілий `api-2`, квиток стає `Sold`. Вбитий контейнер Docker сам не піднімає (ручна зупинка вимикає `restart`), тому повернути другу репліку можна так: `docker compose up -d --scale api=2`.
 - **Зупинка:** `docker compose down` (дані зберігаються), `docker compose down -v` (разом з даними).
 
 ### 6.1. Інтеграційні тести
