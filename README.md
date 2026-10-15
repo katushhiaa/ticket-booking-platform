@@ -32,7 +32,7 @@
 | Категорія стану | Компоненти та елементи коду | Сховище та час життя | Статус та обґрунтування Stateless-придатності |
 |---|---|---|---|
 | **1. Ephemeral / Local Safe**<br/>*(Тимчасовий / локально безпечний)* | • HTTP-контекст запиту (`HttpContext`)<br/>• Вхідні DTO (`CreateBookingRequest`, `ConfirmPaymentRequest`, `RegisterRequest`, `LoginRequest`)<br/>• Локальні стекові змінні методів у контролерах<br/>• Контекст логування (Trace ID, HTTP Request logs) | RAM .NET-процесу<br/>*(Managed Heap, Gen 0 / Stack frame)* | **Безпечно.** Існує виключно протягом обробки одного HTTP-запиту. Автоматично знищується Garbage Collector (GC) після формування відповіді. Не впливає на обробку інших запитів. |
-| **2. Shared / Externalized**<br/>*(Спільний / зовнішній бізнес-стан)* | • Каталог подій, секторів та крісел (`Events`, `Sections`, `SeatSlots`)<br/>• Квитки та їх транзакційні статуси (`Tickets`: `Available`, `Reserved`, `Sold`)<br/>• Бронювання та TTL-резерви (`Bookings`: `Pending`, `Confirmed`, `Expired`, `Cancelled`)<br/>• Користувачі та хеші паролів (`Users`, PBKDF2)<br/>• Сесії та авторизаційні дані | **Primary DB:** PostgreSQL 16<br/>**Distributed Cache:** Redis 7<br/>**Client:** JWT Bearer tokens | **Винесено у зовнішній шар.** Увесь транзакційний та бізнес-стан зберігається в централізованих зовнішніх сховищах. Будь-який інстанс API може прочитати або змінити цей стан через асинхронні запити. |
+| **2. Shared / Externalized**<br/>*(Спільний / зовнішній бізнес-стан)* | • Каталог подій, секторів та крісел (`Events`, `Sections`, `SeatSlots`)<br/>• Квитки та їх транзакційні статуси (`Tickets`: `Available`, `Reserved`, `Sold`)<br/>• Бронювання та TTL-резерви (`Bookings`: `Pending`, `Confirmed`, `Expired`, `Cancelled`)<br/>• Користувачі та хеші паролів (`Users`, PBKDF2)<br/>• Сесії та авторизаційні дані | **Primary DB:** PostgreSQL 16<br/>**Distributed Cache (каталог подій):** Redis 7<br/>**Client:** JWT Bearer tokens | **Винесено у зовнішній шар.** Увесь транзакційний та бізнес-стан зберігається в централізованих зовнішніх сховищах. Будь-який інстанс API може прочитати або змінити цей стан через асинхронні запити. |
 | **3. Critical Stateful Dependencies**<br/>*(Критичні stateful-залежності, підлягають вилученню)* | • In-Memory колекції (`List<T>`, `ConcurrentDictionary` для збереження сесій чи броней)<br/>• Local Locks (`lock()`, `SemaphoreSlim` для блокування квитків)<br/>• In-Memory кеш (`IMemoryCache`)<br/>• Локальні лічильники / Singleton state<br/>• Sticky Sessions / Session Cookies | **Пам'ять (RAM) конкретного контейнера/процесу** | **Повністю усунено / відсутні.** Жодні бізнес-дані, прапорці стану або внутрішньопроцесні блокування не зберігаються у пам'яті C#-процесу. Інстанси є 100% взаємозамінними (Interchangeable Workers). |
 
 ### Детальний аналіз та докази усунення In-Memory залежностей у коді
@@ -47,7 +47,7 @@
    У файлі `Services/ExpiredBookingsCleaner.cs` фонова задача оновлення прострочених бронювань спирається на прямий SQL-запит до бази даних (`WHERE Status = Pending AND ExpiresAt < UtcNow`). Сервіс не зберігає таймери або списки броней у RAM, спираючись на індекс `IX_Bookings_Status_ExpiresAt`.
 
 4. **Централізований Distributed Cache (Redis 7).**
-   Для зняття навантаження з СУБД під час читання каталогу подій та квитків виконується реєстрація `AddStackExchangeRedisCache` замість `AddMemoryCache`. Інвалідація або оновлення кешу подій на одному з інстансів миттєво відображається для всіх інших вузлів кластера.
+   Каталог подій (`GET /api/v1/events`) кешується в Redis через `IDistributedCache` на 60 с (ключ `events:{city|all}`). Кеш спільний для всіх інстансів, тому запис з одного вузла видно на інших. Квитки кешем не є: їхній статус змінюється при кожному бронюванні, тож `GET /events/{id}/tickets` читається з PostgreSQL. Якщо Redis недоступний, каталог віддається з БД (збій кешу не валить API).
 
 ---
 
@@ -57,11 +57,11 @@
 
 1. **Забезпечення взаємозамінності вузлів (Interchangeable Workers).**
    - Усі контролери та сервіси позбавлені локального стану (`static` колекцій, in-memory сесій чи синглтон-прапорців).
-   - Сервіс спирається на безстатусну JWT-автентифікацію (HMAC-SHA256). Будь-який вузол за балансувальником Nginx здатний обробити довільний HTTP-запит, спираючись на стан у PostgreSQL 16 / Redis 7 та заголовок `Authorization: Bearer <token>`.
+   - Сервіс спирається на безстатусну JWT-автентифікацію (HMAC-SHA256). Будь-який вузол за балансувальником Nginx здатний обробити довільний HTTP-запит, спираючись на стан у PostgreSQL 16 та заголовок `Authorization: Bearer <token>`. Redis використовується лише як кеш каталогу подій, а не як сховище сесій.
 
 2. **Декомпозиція та винесення кешу в Redis 7.**
-   - Зареєстровано `AddStackExchangeRedisCache`, що дозволяє винести спільні дані (кеш подій, списки квитків) у зовнішнє key-value сховище `redis:6379`.
-   - Це запобігає асинхронії даних (Stale Data Cache) між різними екземплярами API при оновленні статусів місць.
+   - Зареєстровано `AddStackExchangeRedisCache`; каталог подій кешується у зовнішньому сховищі `redis:6379` з TTL 60 с.
+   - Статуси квитків і місць Redis не кешує, щоб уникнути застарілих даних (Stale Data Cache) при бронюванні; вони завжди читаються з PostgreSQL.
 
 3. **Розподілена транзакційність та захист від Race Condition.**
    - Захист від подвійного бронювання (Double-Booking) перенесено на рівень **PostgreSQL ACID-транзакцій** (`BeginTransactionAsync`) та токена оптимістичного блокування **`Version` (OCC)**.
@@ -84,7 +84,7 @@ sequenceDiagram
     actor Client as Клієнт / Postman
     participant Nginx as Nginx Balancer (Port 80)
     participant API1 as Backend Instance 1 (Node A)
-    participant Redis as Redis 7 (Shared Cache)
+    participant Redis as Redis 7 (Catalog Cache)
     participant Postgres as PostgreSQL 16 (Primary DB)
     participant API2 as Backend Instance 2 (Node B)
 
@@ -93,8 +93,7 @@ sequenceDiagram
     Nginx->>API1: Round-Robin проксіювання запиту
 
     Note over API1: 1. Inbound & Validation<br/>2. Node ID Header (X-Instance-ID: node-a)
-    API1->>Redis: 3. Read Context: Check User Session / Token
-    Redis-->>API1: Session Context Valid
+    Note over API1: 3. Перевірка JWT-підпису (HMAC-SHA256),<br/>без звернення до Redis
 
     API1->>Postgres: 4. Read Context: SELECT * FROM Tickets WHERE Id IN (...)
     Postgres-->>API1: Tickets Found (Status = Available)
@@ -129,7 +128,7 @@ sequenceDiagram
 
 2. **Вичитування контексту зі Shared Storage.**
    - Перевірка токена виконується без звернення до локальної пам'яті (криптографічний верифікатор `JwtOptions`).
-   - Читання статусу квитків з **PostgreSQL 16** / **Redis 7** (`SELECT ... FROM Tickets WHERE Id = ANY(@ids)`).
+   - Читання статусу квитків з **PostgreSQL 16** (`SELECT ... FROM Tickets WHERE Id = ANY(@ids)`). Redis на цьому кроці не використовується.
 
 3. **Атомарні зміни стану.**
    - Відкриття явної транзакції `BeginTransactionAsync()`.
@@ -175,7 +174,7 @@ flowchart TB
         end
 
         Db[("<b>Primary Database</b><br/><small>[Container: PostgreSQL 16]</small><br/>Події, квитки, бронювання,<br/>користувачі (спільний стан)")]:::db
-        Redis[("<b>Distributed Cache</b><br/><small>[Container: Redis 7]</small><br/>Спільний кеш для всіх інстансів")]:::db
+        Redis[("<b>Distributed Cache</b><br/><small>[Container: Redis 7]</small><br/>Кеш каталогу подій, спільний для інстансів")]:::db
 
     end
 
@@ -188,8 +187,8 @@ flowchart TB
     Ctrl2 --> Svc2
     Svc1 -->|"TCP 5432 (Npgsql), OCC + транзакції"| Db
     Svc2 -->|"TCP 5432 (Npgsql), OCC + транзакції"| Db
-    Svc1 -->|"TCP 6379 (кеш подій/квитків)"| Redis
-    Svc2 -->|"TCP 6379 (кеш подій/квитків)"| Redis
+    Svc1 -->|"TCP 6379 (кеш каталогу подій, TTL 60 с)"| Redis
+    Svc2 -->|"TCP 6379 (кеш каталогу подій, TTL 60 с)"| Redis
     Svc1 -->|"HTTPS / REST (TLS 1.3)<br/>Верифікація оплати"| PaymentGateway
     Svc2 -->|"HTTPS / REST (TLS 1.3)<br/>Верифікація оплати"| PaymentGateway
 ```

@@ -39,7 +39,8 @@ services:
       context: .
       dockerfile: Dockerfile
     image: ticket-booking-api:latest
-    restart: unless-stopped
+    # always (а не unless-stopped): після docker kill контейнер піднімається сам, без ручного --scale
+    restart: always
     # Кілька реплік за Nginx. Без container_name (інакше --scale не працює) і без фіксованого host-порту.
     # Запуск: docker compose up -d --build --scale api=2 (те саме, що replicas: 2 нижче)
     deploy:
