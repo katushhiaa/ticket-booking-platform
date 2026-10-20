@@ -1703,12 +1703,294 @@
           ]
         }
       ]
+    },
+    {
+      "name": "05 Cross-Instance (2 репліки за Nginx)",
+      "item": [
+        {
+          "name": "1. POST /auth/login — отримати JWT",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "login"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"katerina@example.com\",\n  \"password\": \"Katerina123\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Статус 200', () => pm.response.to.have.status(200));",
+                  "pm.collectionVariables.set('accessToken', pm.response.json().accessToken);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2. GET /events/{id}/tickets — вибрати вільний квиток",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/events/{{eventId}}/tickets?status=Available",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "events",
+                "{{eventId}}",
+                "tickets?status=Available"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Статус 200', () => pm.response.to.have.status(200));",
+                  "pm.collectionVariables.set('crossTicketId', pm.response.json().tickets[0].id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3. POST /bookings — створення (обробляє Instance A)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/bookings",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "bookings"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{accessToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"ticketIds\": [\"{{crossTicketId}}\"]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Статус 201', () => pm.response.to.have.status(201));",
+                  "pm.test('Бронь Pending', () => pm.expect(pm.response.json().status).to.eql('Pending'));",
+                  "pm.collectionVariables.set('crossBookingId', pm.response.json().id);",
+                  "pm.collectionVariables.set('instanceCreate', pm.response.headers.get('X-Instance-ID'));",
+                  "console.log('Створено на інстансі:', pm.collectionVariables.get('instanceCreate'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4. GET /bookings/{id} — перегляд (можливо, інший Instance B)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/bookings/{{crossBookingId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "bookings",
+                "{{crossBookingId}}"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{accessToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Статус 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Дані актуальні: бронь Pending', () => pm.expect(pm.response.json().status).to.eql('Pending'));",
+                  "pm.test('Квиток у броні збережено', () => pm.expect(pm.response.json().tickets[0].id).to.eql(pm.collectionVariables.get('crossTicketId')));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5. POST /bookings/{id}/confirm — оплата (обробляє інший Instance)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/bookings/{{crossBookingId}}/confirm",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "bookings",
+                "{{crossBookingId}}",
+                "confirm"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{accessToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"paymentTransactionId\": \"PAY-CROSS-001\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Статус 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Бронь Confirmed', () => pm.expect(pm.response.json().status).to.eql('Confirmed'));",
+                  "pm.test('Штрихкод TCK-XXXXXXXX', () => pm.expect(pm.response.json().tickets[0].barcode).to.match(/^TCK-[A-Z0-9]{8}$/));",
+                  "pm.collectionVariables.set('instanceConfirm', pm.response.headers.get('X-Instance-ID'));",
+                  "console.log('Підтверджено на інстансі:', pm.collectionVariables.get('instanceConfirm'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6. GET /events/{id}/tickets — квиток Sold",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/events/{{eventId}}/tickets",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "events",
+                "{{eventId}}",
+                "tickets"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Статус 200', () => pm.response.to.have.status(200));",
+                  "const t = pm.response.json().tickets.find(x => x.id === pm.collectionVariables.get('crossTicketId'));",
+                  "pm.test('Квиток Sold після оплати', () => pm.expect(t.status).to.eql('Sold'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
     }
   ],
   "variable": [
     {
       "key": "baseUrl",
-      "value": "http://localhost:5192"
+      "value": "http://localhost"
     },
     {
       "key": "userId",
@@ -1753,6 +2035,35 @@
     {
       "key": "persistBookingId",
       "value": ""
+    },
+    {
+      "key": "crossTicketId",
+      "value": ""
+    },
+    {
+      "key": "crossBookingId",
+      "value": ""
+    },
+    {
+      "key": "instanceCreate",
+      "value": ""
+    },
+    {
+      "key": "instanceConfirm",
+      "value": ""
+    }
+  ],
+  "event": [
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "pm.test('Заголовок X-Instance-ID присутній', () => {",
+          "  pm.expect(pm.response.headers.get('X-Instance-ID')).to.be.a('string').and.not.be.empty;",
+          "});"
+        ]
+      }
     }
   ]
 }
