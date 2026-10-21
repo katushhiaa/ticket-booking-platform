@@ -55,7 +55,7 @@ services:
       ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_HTTP_PORTS: "8080"
       # Хост = ім'я сервісу бази у спільній мережі
-      ConnectionStrings__DefaultConnection: "Host=db;Port=5432;Database=ticket_booking_db;Username=postgres;Password=postgres"
+      ConnectionStrings__DefaultConnection: "Host=db;Port=5432;Database=ticket_booking_db;Username=postgres;Password=postgres;Maximum Pool Size=20"
       ConnectionStrings__RedisConnection: "redis:6379"
       Jwt__SigningKey: "docker-compose-signing-key-for-lab-only-9f3c2a7e5b1d4c6f8a0e"
     networks:
@@ -66,12 +66,35 @@ services:
     container_name: ticket-booking-nginx
     restart: unless-stopped
     depends_on:
+      # Nginx резолвить api при старті. Якщо api ще не піднявся, upstream запам'ятає неповний список,
+      # тому після `--scale` потрібен перезапуск: docker compose restart nginx
       - api
     ports:
       # Єдина точка входу для клієнтів: http://localhost/...
       - "80:80"
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/active/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - booking-net
+
+  # Експеримент з асиметричним навантаженням (пункт 2.3): один "повільний" інстанс з затримкою 300 мс.
+  #   docker compose --profile experiment up -d --build api-slow
+  api-slow:
+    profiles: ["experiment"]
+    image: ticket-booking-api:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_HTTP_PORTS: "8080"
+      ConnectionStrings__DefaultConnection: "Host=db;Port=5432;Database=ticket_booking_db;Username=postgres;Password=postgres;Maximum Pool Size=20"
+      ConnectionStrings__RedisConnection: "redis:6379"
+      Jwt__SigningKey: "docker-compose-signing-key-for-lab-only-9f3c2a7e5b1d4c6f8a0e"
+      Lab__SimulatedLatencyMs: "300"
     networks:
       - booking-net
 

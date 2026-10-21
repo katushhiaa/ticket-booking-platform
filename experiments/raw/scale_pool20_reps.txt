@@ -1,0 +1,36 @@
+=== scale=1, pool 20, прогін 1: 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    2346.18 [#/sec] (mean)
+    99%     55
+=== scale=1, pool 20, прогін 2: 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    2168.79 [#/sec] (mean)
+    99%     48
+=== scale=1, pool 20, прогін 3: 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    2600.01 [#/sec] (mean)
+    99%     35
+=== scale=2, pool 20, прогін 1: 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    1222.96 [#/sec] (mean)
+    99%    302
+=== scale=2, pool 20, прогін 2: 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    1729.13 [#/sec] (mean)
+    99%     92
+=== scale=2, pool 20, прогін 3: 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    1881.57 [#/sec] (mean)
+    99%     65
+=== scale=3, pool 20, прогін 1: 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    1197.52 [#/sec] (mean)
+    99%    184
+=== scale=3, pool 20, прогін 2: 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    1687.92 [#/sec] (mean)
+    99%    100
+=== scale=3, pool 20, прогін 3: 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    1584.47 [#/sec] (mean)
+    99%    105

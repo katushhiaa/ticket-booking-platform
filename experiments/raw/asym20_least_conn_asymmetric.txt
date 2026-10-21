@@ -1,0 +1,12 @@
+=== least_conn_asymmetric (api x2 + api-slow +300ms, pool 20): 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    1136.28 [#/sec] (mean)
+  Time per request:       44.003 [ms] (mean)
+    50%     14
+    95%    309
+    99%    344
+  розподіл X-Instance-ID (2000 запитів):
+     316 9db88697375a
+     837 e9994d5b61f5
+     847 eca858860034
+

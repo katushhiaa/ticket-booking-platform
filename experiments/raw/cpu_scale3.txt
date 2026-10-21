@@ -1,0 +1,6 @@
+ticket-booking-api-3 CPU=169.42% MEM=118.8MiB / 3.825GiB
+ticket-booking-api-2 CPU=109.90% MEM=100.2MiB / 3.825GiB
+ticket-booking-api-1 CPU=86.77% MEM=118.5MiB / 3.825GiB
+ticket-booking-nginx CPU=42.27% MEM=11.4MiB / 3.825GiB
+ticket-booking-db CPU=153.17% MEM=165.7MiB / 3.825GiB
+ticket-booking-redis-1 CPU=0.53% MEM=10.24MiB / 3.825GiB

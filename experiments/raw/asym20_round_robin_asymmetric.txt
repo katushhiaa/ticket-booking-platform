@@ -1,0 +1,12 @@
+=== round_robin_asymmetric (api x2 + api-slow +300ms, pool 20): 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    400.46 [#/sec] (mean)
+  Time per request:       124.858 [ms] (mean)
+    50%     10
+    95%    323
+    99%    639
+  розподіл X-Instance-ID (2000 запитів):
+     668 9db88697375a
+     666 e9994d5b61f5
+     666 eca858860034
+

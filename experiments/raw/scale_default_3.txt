@@ -1,0 +1,11 @@
+=== scale=3, пул за замовчуванням: 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    1350.58 [#/sec] (mean)
+  Time per request:       37.021 [ms] (mean)
+    50%     31
+    95%     79
+    99%    122
+  розподіл X-Instance-ID (2000 запитів):
+    1001 1fd5dd53b8c1
+     999 5ae596721990
+
