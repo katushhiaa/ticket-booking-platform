@@ -140,6 +140,21 @@ app.Use(async (context, next) =>
     await next();
 });
 
+// Лабораторний експеримент (пункт 2.3): штучна затримка API-запитів на цьому інстансі.
+// За замовчуванням 0 (вимкнено). Вмикається лише сервісом api-slow у профілі "experiment".
+var simulatedLatencyMs = builder.Configuration.GetValue<int>("Lab:SimulatedLatencyMs");
+if (simulatedLatencyMs > 0)
+{
+    app.Use(async (context, next) =>
+    {
+        if (context.Request.Path.StartsWithSegments("/api"))
+        {
+            await Task.Delay(simulatedLatencyMs);
+        }
+        await next();
+    });
+}
+
 // Має стояти далі: перехоплює винятки з усього конвеєра і віддає ProblemDetails замість стек-трейсу
 app.UseExceptionHandler();
 // Порожні 404/405/401 теж віддаються як ProblemDetails

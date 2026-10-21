@@ -1,0 +1,5 @@
+=== failover: з_proxy_next_upstream, вбито ticket-booking-api-2 під час навантаження ===
+  Complete requests:      8000
+  Failed requests:        0
+  Requests per second:    1711.47 [#/sec] (mean)
+  Записи nginx про недоступний upstream (passive health): 161

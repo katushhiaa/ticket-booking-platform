@@ -1,0 +1,11 @@
+=== least_conn, 2 інстанси (симетрично): 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    339.59 [#/sec] (mean)
+  Time per request:       147.237 [ms] (mean)
+    50%    109
+    95%    398
+    99%    510
+  розподіл X-Instance-ID (2000 запитів):
+     998 1fd5dd53b8c1
+    1002 63da7f062a22
+

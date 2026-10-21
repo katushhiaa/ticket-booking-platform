@@ -1,0 +1,11 @@
+=== scale=2, Maximum Pool Size=20: 2000 запитів, паралельність 50 ===
+  Failed requests:        0
+  Requests per second:    990.40 [#/sec] (mean)
+  Time per request:       50.485 [ms] (mean)
+    50%     39
+    95%    102
+    99%    361
+  розподіл X-Instance-ID (2000 запитів):
+    1000 e9994d5b61f5
+    1000 eca858860034
+
