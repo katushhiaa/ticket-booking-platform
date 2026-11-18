@@ -1,0 +1,15 @@
+=== Схема залу, 1000 квитків (GET /events/{id}/tickets?status=Available) ===
+  X-Cache    n   avg, мс   p50, мс   p95, мс   max, мс
+  MISS      30     12.48      9.14     29.27     29.27
+  HIT       30      5.01      3.38     12.16     13.92
+  прискорення p50: x2.7
+=== Демо-подія, 32 квитки (GET /events/{id}/tickets?status=Available) ===
+  X-Cache    n   avg, мс   p50, мс   p95, мс   max, мс
+  MISS      30      5.54      5.01      8.01      8.97
+  HIT       30      4.84      2.75      4.00     62.29
+  прискорення p50: x1.8
+=== Каталог подій (GET /events) ===
+  X-Cache    n   avg, мс   p50, мс   p95, мс   max, мс
+  MISS      30      4.17      3.94      5.52      5.58
+  HIT       30      2.50      2.32      3.10      4.66
+  прискорення p50: x1.7

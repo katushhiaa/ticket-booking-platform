@@ -2,13 +2,14 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using TicketBooking.Api.Contracts;
 using TicketBooking.Api.Data;
+using TicketBooking.Api.Infrastructure.Caching;
 using TicketBooking.Api.Models;
 using TicketBooking.Api.Models.Enums;
 
 namespace TicketBooking.Api.Controllers;
 
 [Route("api/v1/bookings")]
-public class BookingsController(AppDbContext db, ILogger<BookingsController> logger) : ApiControllerBase
+public class BookingsController(AppDbContext db, ResilientCache cache, ILogger<BookingsController> logger) : ApiControllerBase
 {
     /// <summary>TTL резерву: скільки часу квитки утримуються за бронюванням до оплати.</summary>
     public static readonly TimeSpan ReservationTtl = TimeSpan.FromMinutes(15);
@@ -145,6 +146,9 @@ public class BookingsController(AppDbContext db, ILogger<BookingsController> log
         logger.LogInformation("Booking {BookingId} created: {Count} tickets, expires at {ExpiresAt:O}",
             booking.Id, tickets.Count, booking.ExpiresAt);
 
+        // Квитки Available -> Reserved: кешована доступність квитків події застаріла
+        await InvalidateTicketsCache(tickets.Select(t => t.EventId), "booking created");
+
         return CreatedAtAction(nameof(GetById), new { id = booking.Id }, BookingResponse.From(booking));
     }
 
@@ -182,9 +186,11 @@ public class BookingsController(AppDbContext db, ILogger<BookingsController> log
         if (DateTime.UtcNow > booking.ExpiresAt)
         {
             booking.Status = BookingStatus.Expired;
+            var expiredEventIds = booking.Tickets.Select(t => t.EventId).ToList();
             ReleaseTickets(booking);
 
             await SaveAndCommit(transaction, ct);
+            await InvalidateTicketsCache(expiredEventIds, "booking expired on confirm");
 
             return ProblemResult(StatusCodes.Status409Conflict,
                 "Час резерву вичерпано",
@@ -221,6 +227,7 @@ public class BookingsController(AppDbContext db, ILogger<BookingsController> log
         }
 
         logger.LogInformation("Booking {BookingId} confirmed, payment {PaymentId}", booking.Id, paymentTransactionId);
+        await InvalidateTicketsCache(booking.Tickets.Select(t => t.EventId), "booking confirmed");
 
         var response = new ConfirmBookingResponse(
             booking.Id,
@@ -274,6 +281,8 @@ public class BookingsController(AppDbContext db, ILogger<BookingsController> log
         }
 
         booking.Status = BookingStatus.Cancelled;
+        // ReleaseTickets відв'язує квитки від броні, тому події запам'ятовуємо заздалегідь
+        var affectedEventIds = booking.Tickets.Select(t => t.EventId).ToList();
         ReleaseTickets(booking);
 
         try
@@ -289,6 +298,7 @@ public class BookingsController(AppDbContext db, ILogger<BookingsController> log
         }
 
         logger.LogInformation("Booking {BookingId} cancelled", booking.Id);
+        await InvalidateTicketsCache(affectedEventIds, "booking cancelled");
         return NoContent();
     }
 
@@ -325,6 +335,9 @@ public class BookingsController(AppDbContext db, ILogger<BookingsController> log
         await db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);
     }
+
+    private Task InvalidateTicketsCache(IEnumerable<Guid> eventIds, string reason) =>
+        cache.InvalidateAsync(eventIds.Distinct().SelectMany(CacheKeys.AllEventTickets).ToList(), reason);
 
     private static string GenerateBarcode() => $"TCK-{Guid.NewGuid().ToString()[..8].ToUpper()}";
 

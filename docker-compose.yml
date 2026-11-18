@@ -25,7 +25,11 @@ services:
 
   redis:
     image: redis:7-alpine
+    container_name: ticket-booking-redis
     restart: unless-stopped
+    # Кеш ефемерний: без RDB/AOF (після рестарту Redis не повертає застарілі значення),
+    # ліміт пам'яті 128 МБ і витіснення LRU серед усіх ключів при заповненні
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

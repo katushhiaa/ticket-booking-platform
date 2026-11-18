@@ -1,0 +1,39 @@
+# Baseline Environment для навантажувального тестування (ЛР5, п. 2.2).
+# Фіксовані ліміти CPU/RAM роблять прогони відтворюваними й лишають ядра хоста генератору навантаження (k6).
+#
+#   docker compose -f docker-compose.yml -f load-tests/docker-compose.loadtest.yml up -d --build --scale api=2
+#
+# CACHE_ENABLED=false вимикає кеш (експеримент Cache Disabled).
+services:
+  api:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    environment:
+      # Логування на рівні Warning: консольні логи кожного SQL-запиту спотворили б заміри
+      Logging__LogLevel__Default: Warning
+      Logging__LogLevel__Microsoft.AspNetCore: Warning
+      Cache__Enabled: ${CACHE_ENABLED:-true}
+
+  db:
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+
+  redis:
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  nginx:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 128M

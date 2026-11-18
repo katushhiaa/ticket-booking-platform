@@ -5,16 +5,29 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
+using StackExchange.Redis;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using TicketBooking.Api.Auth;
 using TicketBooking.Api.Data;
 using TicketBooking.Api.Infrastructure;
+using TicketBooking.Api.Infrastructure.Caching;
 using TicketBooking.Api.Models;
 using TicketBooking.Api.Services;
 using TicketBooking.Api.Validation;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// ---------- Thread pool ----------
+// При ліміті CPU 1 ядро рантайм ставить мінімум 1 робочий потік, і під сплеском нові потоки додаються повільно.
+// Клієнт StackExchange.Redis тоді не встигає обробити вже отриману відповідь → RedisTimeoutException (ЛР5).
+var minWorkers = builder.Configuration.GetValue("ThreadPool:MinWorkerThreads", 0);
+var minIocp = builder.Configuration.GetValue("ThreadPool:MinIocpThreads", 0);
+if (minWorkers > 0 || minIocp > 0)
+{
+    ThreadPool.GetMinThreads(out var currentWorkers, out var currentIocp);
+    ThreadPool.SetMinThreads(Math.Max(minWorkers, currentWorkers), Math.Max(minIocp, currentIocp));
+}
 
 // ---------- Persistence ----------
 // Без EnableRetryOnFailure: retrying-стратегія несумісна з ручними транзакціями (BeginTransactionAsync) у BookingsController.
@@ -22,12 +35,23 @@ builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection"))
         .AddInterceptors(new PooledConnectionValidator()));
 
-// ---------- Distributed Cache (Redis for Stateless Architecture - Lab 2) ----------
+// ---------- Distributed Cache (Redis, Cache-Aside — ЛР4) ----------
+builder.Services.Configure<CacheSettings>(builder.Configuration.GetSection(CacheSettings.SectionName));
+var cacheSettings = builder.Configuration.GetSection(CacheSettings.SectionName).Get<CacheSettings>() ?? new CacheSettings();
 builder.Services.AddStackExchangeRedisCache(options =>
 {
-    options.Configuration = builder.Configuration.GetConnectionString("RedisConnection") ?? "redis:6379";
-    options.InstanceName = "TicketBooking_";
+    var redis = ConfigurationOptions.Parse(builder.Configuration.GetConnectionString("RedisConnection") ?? "redis:6379");
+    // Короткий таймаут підключення: якщо Redis упав, запит швидко переходить на БД, а не чекає 5 с за замовчуванням.
+    // Таймаут команд довший: під піковим навантаженням відповідь Redis може чекати на CPU інстансу (див. ЛР5)
+    redis.AbortOnConnectFail = false;
+    redis.ConnectTimeout = 1000;
+    redis.SyncTimeout = cacheSettings.OperationTimeoutMs;
+    redis.AsyncTimeout = cacheSettings.OperationTimeoutMs;
+    options.ConfigurationOptions = redis;
+    // Ключі вже мають власний простір імен tb:v1:..., префікс не потрібен
+    options.InstanceName = "";
 });
+builder.Services.AddSingleton<ResilientCache>();
 
 // ---------- MVC + Input Validation ----------
 builder.Services

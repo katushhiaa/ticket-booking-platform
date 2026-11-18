@@ -1,0 +1,84 @@
+{
+  "scenario": "C: Complex Workflow",
+  "label": "C_complex_2inst",
+  "config": {
+    "baseUrl": "http://localhost",
+    "levels": [
+      10,
+      25,
+      50,
+      100,
+      200
+    ],
+    "holdSeconds": 30,
+    "rampSeconds": 5,
+    "warmupSeconds": 20
+  },
+  "rows": [
+    {
+      "vus": 10,
+      "requests": 1200,
+      "rps": 40,
+      "avg": 11.30752166666666,
+      "p50": 9.613,
+      "p90": 21.3998,
+      "p95": 24.084699999999994,
+      "p99": 28.79812,
+      "max": 42.518,
+      "errorRate": 0,
+      "flows_completed": 8
+    },
+    {
+      "vus": 25,
+      "requests": 3016,
+      "rps": 100.53333333333333,
+      "avg": 9.299835212201584,
+      "p50": 7.4825,
+      "p90": 18.325,
+      "p95": 22.828999999999997,
+      "p99": 30.157899999999998,
+      "max": 75.093,
+      "errorRate": 0,
+      "flows_completed": 20.1
+    },
+    {
+      "vus": 50,
+      "requests": 2966,
+      "rps": 98.86666666666666,
+      "avg": 54.53949898853674,
+      "p50": 5.5555,
+      "p90": 16.716000000000005,
+      "p95": 83.37299999999992,
+      "p99": 2024.5536999999993,
+      "max": 2398.821,
+      "errorRate": 0,
+      "flows_completed": 19.766666666666666
+    },
+    {
+      "vus": 100,
+      "requests": 0,
+      "rps": 0,
+      "avg": 0,
+      "p50": 0,
+      "p90": 0,
+      "p95": 0,
+      "p99": 0,
+      "max": 0,
+      "errorRate": 0,
+      "flows_completed": 0
+    },
+    {
+      "vus": 200,
+      "requests": 0,
+      "rps": 0,
+      "avg": 0,
+      "p50": 0,
+      "p90": 0,
+      "p95": 0,
+      "p99": 0,
+      "max": 0,
+      "errorRate": 0,
+      "flows_completed": 0
+    }
+  ]
+}
