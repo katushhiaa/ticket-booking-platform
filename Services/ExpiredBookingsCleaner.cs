@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using TicketBooking.Api.Controllers;
 using TicketBooking.Api.Data;
+using TicketBooking.Api.Infrastructure.Caching;
 using TicketBooking.Api.Models.Enums;
 
 namespace TicketBooking.Api.Services;
@@ -61,6 +62,9 @@ public sealed class ExpiredBookingsCleaner(
             return;
         }
 
+        // ReleaseTickets відв'язує квитки від броні, тому події для інвалідації кешу збираємо заздалегідь
+        var affectedEventIds = expired.SelectMany(b => b.Tickets).Select(t => t.EventId).Distinct().ToList();
+
         foreach (var booking in expired)
         {
             booking.Status = BookingStatus.Expired;
@@ -71,6 +75,9 @@ public sealed class ExpiredBookingsCleaner(
         {
             await db.SaveChangesAsync(ct);
             logger.LogInformation("Released {Count} expired bookings", expired.Count);
+
+            var cache = scope.ServiceProvider.GetRequiredService<ResilientCache>();
+            await cache.InvalidateAsync(affectedEventIds.SelectMany(CacheKeys.AllEventTickets).ToList(), "bookings expired");
         }
         catch (DbUpdateConcurrencyException)
         {

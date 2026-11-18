@@ -4,12 +4,13 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Npgsql;
 using Testcontainers.PostgreSql;
+using Testcontainers.Redis;
 
 namespace TicketBooking.IntegrationTests;
 
 /// <summary>
-/// Піднімає справжній PostgreSQL у Docker (Testcontainers) і запускає API в пам'яті через WebApplicationFactory.
-/// Контейнер один на весь набір тестів; між тестами дані скидаються методом <see cref="ResetAsync"/>.
+/// Піднімає справжні PostgreSQL і Redis у Docker (Testcontainers) і запускає API в пам'яті через WebApplicationFactory.
+/// Контейнери спільні на весь набір тестів; між тестами дані й кеш скидаються методом <see cref="ResetAsync"/>.
 /// </summary>
 public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
 {
@@ -17,12 +18,16 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         .WithImage("postgres:16-alpine")
         .Build();
 
-    public async Task InitializeAsync() => await _postgres.StartAsync();
+    private readonly RedisContainer _redis = new RedisBuilder()
+        .WithImage("redis:7-alpine")
+        .Build();
+
+    public async Task InitializeAsync() => await Task.WhenAll(_postgres.StartAsync(), _redis.StartAsync());
 
     public new async Task DisposeAsync()
     {
         await base.DisposeAsync();
-        await _postgres.DisposeAsync();
+        await Task.WhenAll(_postgres.DisposeAsync().AsTask(), _redis.DisposeAsync().AsTask());
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -34,11 +39,17 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         builder.ConfigureAppConfiguration((_, config) =>
             config.AddInMemoryCollection(new Dictionary<string, string?>
             {
-                ["ConnectionStrings:DefaultConnection"] = _postgres.GetConnectionString()
+                ["ConnectionStrings:DefaultConnection"] = _postgres.GetConnectionString(),
+                ["ConnectionStrings:RedisConnection"] = _redis.GetConnectionString(),
+                // У тестах повторне видалення ключів (double delete) не потрібне й заважало б перевіркам
+                ["Cache:InvalidationRetryDelayMs"] = "0"
             }));
     }
 
-    /// <summary>Повертає дані до стану після сідера: усі квитки Available, жодних бронювань, лише seed-користувач.</summary>
+    /// <summary>
+    /// Повертає дані до стану після сідера: усі квитки Available, жодних бронювань, лише seed-користувач.
+    /// SQL оминає API (а отже й інвалідацію), тому кеш очищуємо повністю.
+    /// </summary>
     public async Task ResetAsync()
     {
         await ExecuteSqlAsync("""
@@ -46,6 +57,16 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
             DELETE FROM "Bookings";
             DELETE FROM "Users" WHERE "Email" <> 'katerina@example.com';
             """);
+        await FlushCacheAsync();
+    }
+
+    public async Task FlushCacheAsync()
+    {
+        var result = await _redis.ExecAsync(["redis-cli", "FLUSHALL"]);
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException($"redis-cli FLUSHALL failed: {result.Stderr}");
+        }
     }
 
     public async Task ExecuteSqlAsync(string sql)
