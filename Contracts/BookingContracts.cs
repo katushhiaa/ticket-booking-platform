@@ -78,3 +78,12 @@ public record ConfirmBookingResponse(
     string PaymentTransactionId,
     decimal TotalAmount,
     IReadOnlyList<PurchasedTicketDto> Tickets);
+
+/// <summary>Елемент історії бронювань користувача (GET /api/v1/users/{userId}/bookings).</summary>
+public record BookingSummaryResponse(
+    Guid Id,
+    BookingStatus Status,
+    decimal TotalAmount,
+    int TicketCount,
+    DateTime CreatedAt,
+    DateTime ExpiresAt);

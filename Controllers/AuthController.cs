@@ -6,17 +6,21 @@ using Microsoft.IdentityModel.JsonWebTokens;
 using TicketBooking.Api.Auth;
 using TicketBooking.Api.Contracts;
 using TicketBooking.Api.Data;
+using TicketBooking.Api.Infrastructure.Replication;
 using AppUser = TicketBooking.Api.Models.User;
 
 namespace TicketBooking.Api.Controllers;
 
 [Route("api/v1/auth")]
 public class AuthController(
-    AppDbContext db,
+    DbRouter router,
     IPasswordHasher<AppUser> passwordHasher,
     IJwtTokenService tokenService,
     ILogger<AuthController> logger) : ApiControllerBase
 {
+    // Реєстрація і логін — Primary: автентифікація вимагає строгої узгодженості (ЛР6)
+    private AppDbContext db => router.Primary;
+
     // POST /api/v1/auth/register
     /// <summary>Реєстрація нового користувача. Повертає JWT-токен.</summary>
     [HttpPost("register")]
@@ -45,6 +49,7 @@ public class AuthController(
 
         db.Users.Add(user);
         await db.SaveChangesAsync(ct);
+        await router.RecordWriteAsync([DbRouter.UserScope(user.Id)], ct);
 
         logger.LogInformation("User {UserId} registered", user.Id);
 
@@ -89,7 +94,9 @@ public class AuthController(
             return ProblemResult(StatusCodes.Status401Unauthorized, "Недійсний токен");
         }
 
-        var user = await db.Users.AsNoTracking().FirstOrDefaultAsync(u => u.Id == userId, ct);
+        // Профіль: Read-Your-Writes — одразу після реєстрації користувач має бачити себе, навіть якщо репліка відстає
+        var user = await router.ReadAsync(ReadConsistency.ReadYourWrites, DbRouter.UserScope(userId),
+            (node, token) => node.Users.AsNoTracking().FirstOrDefaultAsync(u => u.Id == userId, token), ct);
         if (user is null)
         {
             return ProblemResult(StatusCodes.Status401Unauthorized,

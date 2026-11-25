@@ -1,0 +1,77 @@
+
+=== 2.1 Реплікація: запис на Primary → дані на Replica ===
+POST /bookings → бронювання 2a11602e-8a4a-4ed5-8072-ea97cd54dedf створено на Primary
+Primary: Pending
+Replica: Pending
+Спроба запису на репліку:
+  ERROR:  cannot execute DELETE in a read-only transaction
+== Primary: pg_stat_replication
+ application_name | client_addr |   state   | sync_state | primary_lsn | replay_lsn | lag_bytes |   replay_lag    
+------------------+-------------+-----------+------------+-------------+------------+-----------+-----------------
+ db_replica       | 172.18.0.4  | streaming | async      | 0/75B00D90  | 0/75B00D90 |         0 | 00:00:00.000937
+(1 row)
+
+== Replica
+ in_recovery | received_lsn | replayed_lsn | since_last_replayed_xact | apply_delay 
+-------------+--------------+--------------+--------------------------+-------------
+ t           | 0/75B00D90   | 0/75B00D90   | 00:00:00.124558          | 0
+(1 row)
+
+
+=== 2.3–2.4 Stale Read і Read-Your-Writes (lag 3 с) ===
+recovery_min_apply_delay = 3s
+POST /bookings → 85b4ad00-8755-4027-9323-486fe4cdfc21
+
+--- одразу ж читаємо історію з репліки БЕЗ захисту (X-Read-Consistency: eventual):
+HTTP/1.1 200 OK
+X-Db-Node: replica
+X-Db-Route: eventual
+  STALE READ: нового бронювання у відповіді НЕМАЄ
+
+--- те саме читання із захистом Read-Your-Writes (поведінка за замовчуванням):
+HTTP/1.1 200 OK
+X-Db-Node: primary
+X-Db-Route: replica-behind
+  нове бронювання є у відповіді (репліка відстає → прочитано з Primary)
+
+--- через 4 с репліка наздогнала, той самий запит знову йде на репліку:
+HTTP/1.1 200 OK
+X-Db-Node: replica
+X-Db-Route: session-caught-up
+  бронювання є у відповіді
+recovery_min_apply_delay = 0
+
+=== 2.5 Втрата репліки: docker stop ticket-booking-db-replica ===
+--- каталог (eventual), кеш порожній:
+HTTP/1.1 200 OK
+X-Db-Node: primary
+X-Db-Route: replica-down
+X-Cache: MISS
+--- повторно (репліка вже виключена з маршрутизації на 10 с):
+HTTP/1.1 200 OK
+X-Db-Node: primary
+X-Db-Route: replica-down
+X-Cache: MISS
+--- запис працює як завжди:
+  бронювання 5ecbd2f6-de42-43a5-8446-a13da0e6d01d створено
+Репліку запущено знову; через ~10 с читання повертаються на неї.
+HTTP/1.1 200 OK
+X-Db-Node: replica
+X-Db-Route: eventual
+X-Cache: MISS
+
+=== 2.5 Втрата Primary: docker stop ticket-booking-db ===
+--- каталог читається з репліки:
+HTTP/1.1 200 OK
+X-Db-Node: replica
+X-Db-Route: eventual
+X-Cache: MISS
+--- запис блокується (Read-Only Mode):
+HTTP/1.1 503 Service Unavailable
+Retry-After: 10
+  title: Система в режимі лише читання
+  detail: Основний вузол бази даних (Primary) недоступний: операції запису тимчасово заблоковано. Перегляд каталогу працює. Спробуйте пізніше.
+--- статус оплати (strong, лише Primary) — контрольована помилка, без падіння API:
+  HTTP 503
+Primary запущено знову.
+Запис знову працює: бронювання 3d61f075-8c98-4c0e-bb12-e806e73df397

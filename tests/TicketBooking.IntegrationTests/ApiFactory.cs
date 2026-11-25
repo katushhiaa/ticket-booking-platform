@@ -22,6 +22,9 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         .WithImage("redis:7-alpine")
         .Build();
 
+    /// <summary>Рядок підключення до тестового PostgreSQL (у тестах ЛР6 ним же імітується «репліка»).</summary>
+    public string PostgresConnectionString => _postgres.GetConnectionString();
+
     public async Task InitializeAsync() => await Task.WhenAll(_postgres.StartAsync(), _redis.StartAsync());
 
     public new async Task DisposeAsync()

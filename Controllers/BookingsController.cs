@@ -3,14 +3,18 @@ using Microsoft.EntityFrameworkCore;
 using TicketBooking.Api.Contracts;
 using TicketBooking.Api.Data;
 using TicketBooking.Api.Infrastructure.Caching;
+using TicketBooking.Api.Infrastructure.Replication;
 using TicketBooking.Api.Models;
 using TicketBooking.Api.Models.Enums;
 
 namespace TicketBooking.Api.Controllers;
 
 [Route("api/v1/bookings")]
-public class BookingsController(AppDbContext db, ResilientCache cache, ILogger<BookingsController> logger) : ApiControllerBase
+public class BookingsController(DbRouter router, ResilientCache cache, ILogger<BookingsController> logger) : ApiControllerBase
 {
+    // Усі мутації — лише на Primary (ЛР6)
+    private AppDbContext db => router.Primary;
+
     /// <summary>TTL резерву: скільки часу квитки утримуються за бронюванням до оплати.</summary>
     public static readonly TimeSpan ReservationTtl = TimeSpan.FromMinutes(15);
 
@@ -21,11 +25,33 @@ public class BookingsController(AppDbContext db, ResilientCache cache, ILogger<B
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status404NotFound)]
     public async Task<IActionResult> GetById([FromRoute] Guid id, CancellationToken ct)
     {
-        var booking = await LoadBookingWithTickets(id, tracking: false, ct);
+        // Статус оплати / підтвердження транзакції: Strong Consistency → завжди Primary (Explicit Primary Routing, ЛР6)
+        var booking = await router.ReadAsync(ReadConsistency.Strong, null,
+            (primary, token) => LoadBookingWithTickets(primary, id, tracking: false, token), ct);
 
         return booking is null
             ? BookingNotFound(id)
             : Ok(BookingResponse.From(booking));
+    }
+
+    // GET /api/v1/users/{userId}/bookings
+    /// <summary>
+    /// Історія бронювань користувача. Read-Your-Own-Writes (ЛР6): одразу після власного бронювання/оплати
+    /// користувач має побачити зміни, тому репліка використовується лише якщо вже програла WAL до LSN його останнього запису.
+    /// </summary>
+    [HttpGet("/api/v1/users/{userId:guid}/bookings")]
+    [ProducesResponseType(typeof(IReadOnlyList<BookingSummaryResponse>), StatusCodes.Status200OK)]
+    public async Task<IActionResult> GetUserBookings([FromRoute] Guid userId, CancellationToken ct)
+    {
+        var bookings = await router.ReadAsync(ReadConsistency.ReadYourWrites, DbRouter.UserScope(userId),
+            (node, token) => node.Bookings.AsNoTracking()
+                .Where(b => b.UserId == userId)
+                .OrderByDescending(b => b.CreatedAt)
+                .Take(100)
+                .Select(b => new BookingSummaryResponse(b.Id, b.Status, b.TotalAmount, b.Tickets.Count, b.CreatedAt, b.ExpiresAt))
+                .ToListAsync(token), ct);
+
+        return Ok(bookings);
     }
 
     // POST /api/v1/bookings
@@ -146,6 +172,8 @@ public class BookingsController(AppDbContext db, ResilientCache cache, ILogger<B
         logger.LogInformation("Booking {BookingId} created: {Count} tickets, expires at {ExpiresAt:O}",
             booking.Id, tickets.Count, booking.ExpiresAt);
 
+        // Межа запису для Read-Your-Writes — до інвалідації кешу (ЛР6)
+        await RecordWrite(booking.UserId, tickets.Select(t => t.EventId));
         // Квитки Available -> Reserved: кешована доступність квитків події застаріла
         await InvalidateTicketsCache(tickets.Select(t => t.EventId), "booking created");
 
@@ -166,7 +194,7 @@ public class BookingsController(AppDbContext db, ResilientCache cache, ILogger<B
     {
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
 
-        var booking = await LoadBookingWithTickets(id, tracking: true, ct);
+        var booking = await LoadBookingWithTickets(db, id, tracking: true, ct);
         if (booking is null)
         {
             await transaction.RollbackAsync(ct);
@@ -190,6 +218,7 @@ public class BookingsController(AppDbContext db, ResilientCache cache, ILogger<B
             ReleaseTickets(booking);
 
             await SaveAndCommit(transaction, ct);
+            await RecordWrite(booking.UserId, expiredEventIds);
             await InvalidateTicketsCache(expiredEventIds, "booking expired on confirm");
 
             return ProblemResult(StatusCodes.Status409Conflict,
@@ -227,6 +256,7 @@ public class BookingsController(AppDbContext db, ResilientCache cache, ILogger<B
         }
 
         logger.LogInformation("Booking {BookingId} confirmed, payment {PaymentId}", booking.Id, paymentTransactionId);
+        await RecordWrite(booking.UserId, booking.Tickets.Select(t => t.EventId));
         await InvalidateTicketsCache(booking.Tickets.Select(t => t.EventId), "booking confirmed");
 
         var response = new ConfirmBookingResponse(
@@ -255,7 +285,7 @@ public class BookingsController(AppDbContext db, ResilientCache cache, ILogger<B
     {
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
 
-        var booking = await LoadBookingWithTickets(id, tracking: true, ct);
+        var booking = await LoadBookingWithTickets(db, id, tracking: true, ct);
         if (booking is null)
         {
             await transaction.RollbackAsync(ct);
@@ -298,15 +328,16 @@ public class BookingsController(AppDbContext db, ResilientCache cache, ILogger<B
         }
 
         logger.LogInformation("Booking {BookingId} cancelled", booking.Id);
+        await RecordWrite(booking.UserId, affectedEventIds);
         await InvalidateTicketsCache(affectedEventIds, "booking cancelled");
         return NoContent();
     }
 
     // ---------- helpers ----------
 
-    private Task<Booking?> LoadBookingWithTickets(Guid id, bool tracking, CancellationToken ct)
+    private static Task<Booking?> LoadBookingWithTickets(AppDbContext node, Guid id, bool tracking, CancellationToken ct)
     {
-        IQueryable<Booking> query = db.Bookings
+        IQueryable<Booking> query = node.Bookings
             .Include(b => b.Tickets).ThenInclude(t => t.Section)
             .Include(b => b.Tickets).ThenInclude(t => t.SeatSlot);
 
@@ -335,6 +366,9 @@ public class BookingsController(AppDbContext db, ResilientCache cache, ILogger<B
         await db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);
     }
+
+    private Task RecordWrite(Guid userId, IEnumerable<Guid> eventIds) =>
+        router.RecordWriteAsync([DbRouter.UserScope(userId), .. eventIds.Distinct().Select(DbRouter.EventScope)]);
 
     private Task InvalidateTicketsCache(IEnumerable<Guid> eventIds, string reason) =>
         cache.InvalidateAsync(eventIds.Distinct().SelectMany(CacheKeys.AllEventTickets).ToList(), reason);
