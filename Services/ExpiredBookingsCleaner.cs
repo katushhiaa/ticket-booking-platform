@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using TicketBooking.Api.Controllers;
 using TicketBooking.Api.Data;
 using TicketBooking.Api.Infrastructure.Caching;
+using TicketBooking.Api.Infrastructure.Replication;
 using TicketBooking.Api.Models.Enums;
 
 namespace TicketBooking.Api.Services;
@@ -75,6 +76,11 @@ public sealed class ExpiredBookingsCleaner(
         {
             await db.SaveChangesAsync(ct);
             logger.LogInformation("Released {Count} expired bookings", expired.Count);
+
+            // Межа запису для Read-Your-Writes (ЛР6) — до інвалідації кешу
+            var router = scope.ServiceProvider.GetRequiredService<DbRouter>();
+            await router.RecordWriteAsync(
+                [.. affectedEventIds.Select(DbRouter.EventScope), .. expired.Select(b => DbRouter.UserScope(b.UserId))], ct);
 
             var cache = scope.ServiceProvider.GetRequiredService<ResilientCache>();
             await cache.InvalidateAsync(affectedEventIds.SelectMany(CacheKeys.AllEventTickets).ToList(), "bookings expired");

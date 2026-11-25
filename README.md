@@ -23,6 +23,7 @@
 8. [Лабораторна робота №3: балансування, відмовостійкість, масштабування](#8-лабораторна-робота-3-балансування-відмовостійкість-масштабування)
 9. [Лабораторна робота №4: розподілене кешування (Redis)](#9-лабораторна-робота-4-розподілене-кешування-redis)
 10. [Лабораторна робота №5: базовий рівень продуктивності](#10-лабораторна-робота-5-базовий-рівень-продуктивності-load-performance-baseline)
+11. [Лабораторна робота №6: реплікація БД та Read/Write Separation](#11-лабораторна-робота-6-реплікація-бд-та-readwrite-separation)
 
 ---
 
@@ -149,6 +150,8 @@ sequenceDiagram
 
 Архітектурна схема з кількома інстансами API за балансувальником Nginx (upstream `api_servers`, алгоритм Round Robin за замовчуванням; без sticky sessions). Усі інстанси ходять у спільний PostgreSQL 16 (бізнес-стан) і Redis 7 (розподілений кеш); жодного стану в пам'яті контейнера немає, тому будь-який інстанс може обробити будь-який запит.
 
+З ЛР6 база — це топологія **Primary + Read Replica**: записи й строгі читання йдуть на Primary, читання з допустимою eventual consistency — на репліку, яка асинхронно програє WAL Primary. Маршрут обирає `DbRouter` у шарі доступу до даних (розділ [11](#11-лабораторна-робота-6-реплікація-бд-та-readwrite-separation)).
+
 ```mermaid
 flowchart TB
     classDef person fill:#08427b,stroke:#073b6f,color:#fff;
@@ -176,7 +179,8 @@ flowchart TB
             end
         end
 
-        Db[("<b>Primary Database</b><br/><small>[Container: PostgreSQL 16]</small><br/>Події, квитки, бронювання,<br/>користувачі (спільний стан)")]:::db
+        Db[("<b>Primary Database</b><br/><small>[Container: PostgreSQL 16, ticket-booking-db]</small><br/>Усі записи й транзакції, strong-читання<br/>(логін, статус оплати)")]:::db
+        Replica[("<b>Read Replica</b><br/><small>[Container: PostgreSQL 16 Hot Standby, ticket-booking-db-replica]</small><br/>Лише читання: каталог, схема залу,<br/>історія бронювань (Read-Your-Writes)")]:::db
         Redis[("<b>Distributed Cache</b><br/><small>[Container: Redis 7, 128 МБ, allkeys-lru]</small><br/>Cache-Aside: каталог подій, доступність квитків<br/>(спільний для інстансів, без persistence)")]:::db
 
     end
@@ -188,8 +192,11 @@ flowchart TB
     Nginx -->|"upstream api_servers (API 2)"| Ctrl2
     Ctrl1 --> Svc1
     Ctrl2 --> Svc2
-    Svc1 -->|"TCP 5432 (Npgsql), OCC + транзакції"| Db
-    Svc2 -->|"TCP 5432 (Npgsql), OCC + транзакції"| Db
+    Svc1 -->|"W + strong R: TCP 5432, OCC + транзакції"| Db
+    Svc2 -->|"W + strong R: TCP 5432, OCC + транзакції"| Db
+    Svc1 -.->|"eventual / RYW R (DbRouter)"| Replica
+    Svc2 -.->|"eventual / RYW R (DbRouter)"| Replica
+    Db ==>|"WAL streaming (async), replicator"| Replica
     Svc1 -->|"TCP 6379: GET/SET (Cache-Aside), DEL після коміту"| Redis
     Svc2 -->|"TCP 6379: GET/SET (Cache-Aside), DEL після коміту"| Redis
     Svc1 -->|"HTTPS / REST (TLS 1.3)<br/>Верифікація оплати"| PaymentGateway
@@ -300,6 +307,7 @@ erDiagram
 | `POST` | `/api/v1/bookings/{id}/confirm` | Підтвердження оплати, генерація штрихкодів, статус `Sold` | Напарник |
 | `DELETE` | `/api/v1/bookings/{id}` | Скасування бронювання та повернення квитків у продаж | Напарник |
 | `GET` | `/api/v1/bookings/{id}` | Перегляд бронювання з квитками та залишком TTL | Напарник |
+| `GET` | `/api/v1/users/{userId}/bookings` | Історія бронювань користувача (ЛР6: Read-Your-Writes, репліка або Primary) | Напарник |
 | `POST` | `/api/v1/auth/register` | Реєстрація користувача (пароль хешується PBKDF2), повертає JWT | Напарник |
 | `POST` | `/api/v1/auth/login` | Автентифікація за email/паролем, повертає JWT (HMAC-SHA256, 60 хв) | Напарник |
 | `GET` | `/api/v1/auth/me` | Профіль поточного користувача (`Authorization: Bearer <token>`) | Напарник |
@@ -422,6 +430,7 @@ docker compose logs api
     --folder "05 Cross-Instance (2 репліки за Nginx)"
   ```
 
+- **Реплікація БД (ЛР6):** разом зі стеком стартує `ticket-booking-db-replica` (порт 5433 на хості), яка при першому запуску сама знімає копію Primary. Стан: `scripts/replication-status.sh`; з якого вузла прочитано відповідь — заголовки `X-Db-Node` / `X-Db-Route`. Деталі — [розділ 11](#11-лабораторна-робота-6-реплікація-бд-та-readwrite-separation).
 - **Скидання бази (чистий стан перед повторним прогоном):**
 
   ```bash
@@ -522,7 +531,7 @@ upstream api_servers {
     server api:8080 max_fails=2 fail_timeout=10s;
 }
 # у location /
-proxy_next_upstream error timeout http_500 http_502 http_503;
+proxy_next_upstream error timeout http_500 http_502 http_503;   # у ЛР6 http_503 прибрано, див. 11.5
 proxy_next_upstream_tries 3;
 ```
 
@@ -986,3 +995,323 @@ docker compose up -d --build --scale api=2 && docker compose restart nginx
 ```
 
 Потрібен k6 на хості (`brew install k6`). Параметри профілю: `LEVELS`, `HOLD_SECONDS`, `RAMP_SECONDS`, `WARMUP_SECONDS`, `THINK_SECONDS`, `BASE_URL`.
+
+---
+
+## 11. Лабораторна робота №6: реплікація БД та Read/Write Separation
+
+Основна БД тепер складається з двох вузлів PostgreSQL 16: **Primary** (`ticket-booking-db`) приймає всі записи, **Read Replica** (`ticket-booking-db-replica`) — Hot Standby, що асинхронно програє журнал WAL Primary і обслуговує читання. Який вузол обслуговує конкретне читання, вирішує `DbRouter` у шарі доступу до даних — за вимогою бізнес-сценарію до узгодженості.
+
+### 11.1. Топологія реплікації (Primary / Replica)
+
+| Що | Де | Значення |
+|---|---|---|
+| WAL для реплікації | `docker-compose.yml`, `db.command` | `wal_level=replica`, `max_wal_senders=10`, `wal_keep_size=256MB` (запас WAL для репліки, що відстала або перезапускалась) |
+| Користувач реплікації | `db/primary/initdb/10-replication-user.sh` (новий volume), `db/replica/bootstrap.sh` (існуючий volume, ідемпотентно) | `replicator` з атрибутом `REPLICATION`, пароль SCRAM |
+| Доступ | `db/primary/pg_hba.conf` (монтується, `-c hba_file=...`) | `host replication replicator all scram-sha-256` — реплікаційне з'єднання дозволене лише цьому користувачу |
+| Ініціалізація репліки | `db/replica/bootstrap.sh` | Порожній data-каталог → `pg_basebackup --wal-method=stream` (фізична копія Primary), `standby.signal` + `primary_conninfo` |
+| Режим репліки | там само | `hot_standby=on` (читання під час програвання WAL), `hot_standby_feedback=on` (Primary не прибирає рядки, які ще читає репліка → менше скасованих запитів) |
+| Тип | — | Асинхронна потокова (`sync_state = async`): Primary не чекає репліку при коміті |
+| Порти на хості | — | Primary 5432, Replica 5433 |
+
+Перевірка (`scripts/replication-demo.sh replication`): бронювання, створене через API, одразу видно на репліці; спроба запису на репліку відхиляється самою СУБД; `pg_stat_replication` на Primary показує стрімінг і нульове відставання.
+
+```text
+=== 2.1 Реплікація: запис на Primary → дані на Replica ===
+POST /bookings → бронювання 2a11602e-8a4a-4ed5-8072-ea97cd54dedf створено на Primary
+Primary: Pending
+Replica: Pending
+Спроба запису на репліку:
+  ERROR:  cannot execute DELETE in a read-only transaction
+== Primary: pg_stat_replication
+ application_name | client_addr |   state   | sync_state | primary_lsn | replay_lsn | lag_bytes |   replay_lag    
+------------------+-------------+-----------+------------+-------------+------------+-----------+-----------------
+ db_replica       | 172.18.0.4  | streaming | async      | 0/75B00D90  | 0/75B00D90 |         0 | 00:00:00.000937
+(1 row)
+
+== Replica
+ in_recovery | received_lsn | replayed_lsn | since_last_replayed_xact | apply_delay 
+-------------+--------------+--------------+--------------------------+-------------
+ t           | 0/75B00D90   | 0/75B00D90   | 00:00:00.124558          | 0
+(1 row)
+```
+
+### 11.2. Read/Write Separation у коді (`Infrastructure/Replication/DbRouter.cs`)
+
+Маршрутизація програмна (Multi-Pool Manager): у застосунку два пули з'єднань Npgsql — Primary (`ConnectionStrings:DefaultConnection`) і Replica (`ConnectionStrings:ReplicaConnection`, `Timeout=2`).
+
+- **Запис** — завжди Primary. Контролери, що змінюють дані, працюють із `router.Primary` — тим самим `AppDbContext`, що й раніше; транзакції, блокування й OCC не змінилися.
+- **Читання** — `router.ReadAsync(consistency, scope, query)`. Контролер описує лише вимогу до узгодженості, а вузол обирає роутер:
+
+```csharp
+// Публічний каталог: Eventual → репліка
+router.ReadAsync(ReadConsistency.Eventual, null, (db, ct) => db.Events...ToListAsync(ct), ct);
+// Статус оплати: Strong → завжди Primary
+router.ReadAsync(ReadConsistency.Strong, null, (db, ct) => LoadBookingWithTickets(db, id, ...), ct);
+// Історія бронювань: Read-Your-Writes → репліка, якщо вона вже має останній запис цього користувача
+router.ReadAsync(ReadConsistency.ReadYourWrites, DbRouter.UserScope(userId), (db, ct) => ..., ct);
+```
+
+Обраний вузол і причина повертаються в заголовках `X-Db-Node: primary|replica` і `X-Db-Route` (`eventual`, `strong`, `session-no-writes`, `session-caught-up`, `replica-behind`, `replica-down`, `no-replica`, `single-primary`). `Replication:Enabled=false` (env `REPLICA_ENABLED=false`) вмикає топологію Single Primary без зміни коду — так виконано порівняння в 11.6.
+
+Чому в коді, а не в проксі (Pgpool-II / MaxScale): проксі бачить лише SQL і не відрізнить «каталог» від «мої бронювання одразу після оплати». Рівень узгодженості — властивість бізнес-сценарію, тому рішення ухвалює код, який цей сценарій знає.
+
+### 11.3. Класифікація читань і Replication Lag
+
+| Операція | Ендпоінт | Узгодженість | Вузол | Чому |
+|---|---|---|---|---|
+| Каталог подій | `GET /api/v1/events` | Eventual | Replica | Публічний список; нова подія може з'явитися на мілісекунди пізніше |
+| Схема залу | `GET /api/v1/events/{id}/tickets` | Eventual + межа запису події | Replica (Primary, поки репліка не наздогнала останнє бронювання події) | Показ місць допускає застарілість: сам продаж перевіряється на Primary (OCC). Але після бронювання кеш (ЛР4) інвалідується, і повторне заповнення з репліки, що відстає, поклало б у Redis на 30 с стан до продажу. Тому подія має свою «межу запису» (11.4) |
+| Історія бронювань | `GET /api/v1/users/{id}/bookings` | Read-Your-Writes | Replica або Primary | Користувач щойно оплатив і має побачити своє бронювання |
+| Профіль | `GET /api/v1/auth/me` | Read-Your-Writes | Replica або Primary | Одразу після реєстрації |
+| Статус бронювання / оплати | `GET /api/v1/bookings/{id}` | Strong | Primary | Підтвердження транзакції: застаріле «Pending» після оплати — це помилка, а не затримка |
+| Логін | `POST /api/v1/auth/login` | Strong | Primary | Автентифікація: щойно змінений пароль має діяти одразу |
+| Бронювання, оплата, скасування, реєстрація | `POST`/`DELETE` | — (запис) | Primary | Мутуючі операції |
+
+**Відставання під навантаженням.** `scripts/replication-lag-under-load.sh`: сценарій B (бронювання без пауз, 10→100 VU) і кожні 0.5 с — `pg_stat_replication` (сирі дані: `experiments/raw/lab6_replication_lag.csv`):
+
+| Метрика | Медіана | p95 | Максимум |
+|---|---:|---:|---:|
+| Відставання, байт WAL (`pg_current_wal_lsn() − replay_lsn`) | 640 | 26 256 | 49 256 |
+| `replay_lag` (запис закомічено → видно на репліці), мс | 0.85 | 8.17 | 36.43 |
+
+На одній машині репліка відстає на одиниці мілісекунд — Stale Read на живому стенді зловити складно, але він реальний: між комітом на Primary і появою рядка на репліці завжди є вікно. У продакшені (окремий сервер, мережа між AZ, важкий запит на репліці, `VACUUM`) це вже сотні мілісекунд — секунди. Для демонстрації лаг відтворено синтетично: `recovery_min_apply_delay` — репліка отримує WAL одразу, але програє його із затримкою (`scripts/replica-lag.sh 3000`).
+
+**Stale Read** (`scripts/replication-demo.sh stale-read`, лаг 3 с): користувач створив бронювання й одразу відкрив історію. Заголовок `X-Read-Consistency: eventual` примусово читає з репліки (лише для демонстрації) — бронювання у відповіді немає.
+
+```text
+=== 2.3–2.4 Stale Read і Read-Your-Writes (lag 3 с) ===
+recovery_min_apply_delay = 3s
+POST /bookings → 85b4ad00-8755-4027-9323-486fe4cdfc21
+
+--- одразу ж читаємо історію з репліки БЕЗ захисту (X-Read-Consistency: eventual):
+HTTP/1.1 200 OK
+X-Db-Node: replica
+X-Db-Route: eventual
+  STALE READ: нового бронювання у відповіді НЕМАЄ
+
+--- те саме читання із захистом Read-Your-Writes (поведінка за замовчуванням):
+HTTP/1.1 200 OK
+X-Db-Node: primary
+X-Db-Route: replica-behind
+  нове бронювання є у відповіді (репліка відстає → прочитано з Primary)
+
+--- через 4 с репліка наздогнала, той самий запит знову йде на репліку:
+HTTP/1.1 200 OK
+X-Db-Node: replica
+X-Db-Route: session-caught-up
+  бронювання є у відповіді
+recovery_min_apply_delay = 0
+```
+
+### 11.4. Read-After-Write Consistency: перевірка LSN
+
+Реалізовано **Read-Your-Own-Writes Verification** (звірка LSN), а не просте Sticky Routing з TTL:
+
+1. Після коміту запису `DbRouter.RecordWriteAsync` читає з Primary `pg_current_wal_lsn()` — позицію журналу, що вже містить цей коміт, — і зберігає її в Redis як **межу запису** сесії: `tb:v1:replication:write-fence:user:{id}:lsn` (і `event:{id}` для схеми залу) з TTL 30 с.
+2. Читання Read-Your-Writes бере межу сесії. Якщо її немає (сесія нічого не писала 30 с) — одразу репліка (`session-no-writes`).
+3. Якщо межа є — запит до репліки `pg_last_wal_replay_lsn()`. Репліка вже програла журнал до межі → читаємо з неї (`session-caught-up`), інакше → Primary (`replica-behind`).
+4. Redis недоступний, і межу прочитати не вдалося → Primary (`session-unknown`): безпечніше переплатити читанням з Primary, ніж показати застарілі дані.
+
+```mermaid
+sequenceDiagram
+    participant U as Користувач
+    participant API as API (DbRouter)
+    participant P as Primary
+    participant R as Redis
+    participant S as Replica
+    U->>API: POST /bookings
+    API->>P: INSERT ... COMMIT
+    API->>P: SELECT pg_current_wal_lsn()  → 0/75B00D90
+    API->>R: SET write-fence:user:{id} = 0/75B00D90 (TTL 30 с)
+    U->>API: GET /users/{id}/bookings
+    API->>R: GET write-fence:user:{id}
+    API->>S: SELECT pg_last_wal_replay_lsn()
+    alt репліка ≥ межі
+        API->>S: SELECT ... (X-Db-Route: session-caught-up)
+    else репліка відстає
+        API->>P: SELECT ... (X-Db-Route: replica-behind)
+    end
+```
+
+Порівняння зі Sticky Routing (усі читання користувача на Primary протягом N секунд після запису): sticky простіший, але гарантує консистентність лише якщо лаг < N, і при цьому відправляє на Primary всі читання навіть тоді, коли репліка давно наздогнала (на нашому стенді — через ~1 мс). LSN-перевірка точна в обидва боки: на Primary йдуть лише ті читання, для яких репліка справді ще не має запису. Ціна — додатковий `GET` у Redis і короткий запит до репліки на кожне Read-Your-Writes читання (у сценарії D це видно як Redis misses у `*.env.txt`).
+
+Межа ставиться **до** інвалідації кешу (`BookingsController`, `ExpiredBookingsCleaner`): інакше паралельний запит міг би між інвалідацією і записом межі заповнити кеш з репліки, що відстає.
+
+### 11.5. Відмовостійкість: втрата Replica і Primary
+
+**Втрата Replica** (`docker stop ticket-booking-db-replica`): перше читання отримує помилку з'єднання і прозоро повторюється на Primary (`X-Db-Route: replica-down`). Репліка виключається з маршрутизації на 10 с (`ReplicaHealth`, circuit breaker) — наступні читання одразу йдуть на Primary без спроби підключення. Через 10 с роутер знову пробує репліку; після `docker start` читання повертаються на неї без рестарту API.
+
+```text
+=== 2.5 Втрата репліки: docker stop ticket-booking-db-replica ===
+--- каталог (eventual), кеш порожній:
+HTTP/1.1 200 OK
+X-Db-Node: primary
+X-Db-Route: replica-down
+X-Cache: MISS
+--- повторно (репліка вже виключена з маршрутизації на 10 с):
+HTTP/1.1 200 OK
+X-Db-Node: primary
+X-Db-Route: replica-down
+X-Cache: MISS
+--- запис працює як завжди:
+  бронювання 5ecbd2f6-de42-43a5-8446-a13da0e6d01d створено
+Репліку запущено знову; через ~10 с читання повертаються на неї.
+HTTP/1.1 200 OK
+X-Db-Node: replica
+X-Db-Route: eventual
+X-Cache: MISS
+```
+
+**Втрата Primary** (`docker stop ticket-booking-db`): каталог і схема залу продовжують читатися з репліки. Мутації отримують контрольовану відповідь **503 «Система в режимі лише читання»** з `Retry-After: 10` (`GlobalExceptionHandler`: помилка з'єднання з БД на не-GET запиті). Strong-читання (статус оплати) — 503, бо їх свідомо не обслуговують з репліки. API-контейнери не падають, після `docker start` запис відновлюється сам (пул з'єднань перевіряє «мертві» з'єднання, ЛР2).
+
+```text
+=== 2.5 Втрата Primary: docker stop ticket-booking-db ===
+--- каталог читається з репліки:
+HTTP/1.1 200 OK
+X-Db-Node: replica
+X-Db-Route: eventual
+X-Cache: MISS
+--- запис блокується (Read-Only Mode):
+HTTP/1.1 503 Service Unavailable
+Retry-After: 10
+  title: Система в режимі лише читання
+  detail: Основний вузол бази даних (Primary) недоступний: операції запису тимчасово заблоковано. Перегляд каталогу працює. Спробуйте пізніше.
+--- статус оплати (strong, лише Primary) — контрольована помилка, без падіння API:
+  HTTP 503
+Primary запущено знову.
+Запис знову працює: бронювання 3d61f075-8c98-4c0e-bb12-e806e73df397
+```
+
+**Знахідка: Nginx «вбивав» і читання.** Перша спроба сценарію з Primary дала 502 на каталозі: у конфігах ЛР3 `proxy_next_upstream ... http_503`, тож кожен 503 від API рахувався відмовою інстансу (`max_fails=2`). Після кількох записів у режимі лише читання Nginx виключав з ротації **обидва** здорові інстанси (`no live upstreams`), і падали навіть читання з репліки. 503 від нашого API означає недоступність спільної залежності (Primary), а не самого інстансу: повтор на іншому інстансі не допоможе. Тому `http_503` прибрано з `proxy_next_upstream` у всіх конфігах `nginx/` (`error`, `timeout`, `http_500`, `http_502` лишились — для падіння самого інстансу, як у ЛР3).
+
+| Сценарій збою | Читання eventual | Читання strong | Запис | API |
+|---|---|---|---|---|
+| Replica down | Primary (fallback), 200 | Primary, 200 | 200/201 | Працює |
+| Primary down | Replica, 200 | 503 | 503 Read-Only + `Retry-After` | Працює |
+| Primary down (до виправлення Nginx) | 502 після кількох 503 | 503 → 502 | 503 → 502 | Обидва інстанси виключено Nginx |
+
+Автоматичного промоуту репліки немає свідомо (див. split-brain у 11.8): у цій топології втрата Primary — це деградація до Read-Only, а не відмова.
+
+### 11.6. Read Scaling: Single Primary vs Primary + Replica
+
+**Методика.** Сценарій **D — Mixed** (`load-tests/d-mixed.js`): 80% читань (схема залу на 1000 квитків і каталог), 20% бронювань. Кеш вимкнено, бо з кешем читання майже не доходять до БД (ЛР5: 7 транзакцій БД на 1000 запитів) і репліці нічого розвантажувати. Кожен вузол БД обмежено **0.5 CPU** (однакові вузли в обох топологіях), API — 4 інстанси по 1 CPU, щоб у Single Primary вузьким місцем була саме БД. Профіль той самий, що в ЛР5 (рівні 10→200 VU по 30 с); `REPLICA_ENABLED=false/true` перемикає лише маршрутизацію. Запуск: `load-tests/run-lab6.sh` (~30 хв). Додатково сценарій A (100% читань).
+
+**Стандартний профіль (пауза 0.2 с), сценарій D:**
+
+| VUs | RPS: Single | RPS: + Replica | p95, мс: Single | p95, мс: + Replica | p99, мс: Single | p99, мс: + Replica |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 47.1 | **47.3** | 26.3 | **23.1** | 38.4 | **37.0** |
+| 25 | 120.2 | **119.2** | 15.1 | **20.1** | 24.6 | **29.0** |
+| 50 | 230.9 | **240.4** | 26.0 | **15.1** | 308.3 | **31.5** |
+| 100 | 226.4 | **469.9** | 725.0 | **18.0** | 1 209.0 | **201.2** |
+| 200 | 270.1 | **536.7** | 1 311.6 | **439.4** | 1 897.7 | **607.3** |
+
+**Stress (без пауз), сценарій D, два прогони:**
+
+| VUs | RPS: Single | RPS: + Replica | p95, мс: Single | p95, мс: + Replica | p99, мс: Single | p99, мс: + Replica |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 296.6 | **523.8** | 90.7 | **61.9** | 105.2 | **77.5** |
+| 25 | 256.4 | **513.7** | 207.7 | **108.9** | 305.7 | **160.1** |
+| 50 | 257.7 | **518.4** | 493.6 | **223.7** | 691.6 | **312.6** |
+| 100 | 259.8 | **531.8** | 964.9 | **468.9** | 1 301.4 | **603.8** |
+| 200 | 291.9 | **528.4** | 1 518.8 | **960.0** | 1 890.0 | **1 196.6** |
+
+<sub>Прогін 2 (`*_stress_run2`). Прогін 1: Single — 308.1 / 255.2 / 256.0 / 282.0 / 279.3 RPS, + Replica — 516.9 / 425.1 / 471.0 / 465.2 / 511.0 RPS.</sub>
+
+```mermaid
+xychart-beta
+    title "Сценарій D, stress: RPS"
+    x-axis "VUs" [10, 25, 50, 100, 200]
+    y-axis "RPS" 0 --> 586
+    line [296.6, 256.4, 257.7, 259.8, 291.9]
+    line [523.8, 513.7, 518.4, 531.8, 528.4]
+```
+
+<sub>лінія 1 — `Single Primary` · лінія 2 — `Primary + Replica`</sub>
+
+```mermaid
+xychart-beta
+    title "Сценарій D, стандартний профіль: p99, мс"
+    x-axis "VUs" [10, 25, 50, 100, 200]
+    y-axis "p99, мс" 0 --> 2088
+    line [38.4, 24.6, 308.3, 1209.0, 1897.7]
+    line [37.0, 29.0, 31.5, 201.2, 607.3]
+```
+
+<sub>лінія 1 — `Single Primary` · лінія 2 — `Primary + Replica`</sub>
+
+**Ресурси (середнє / максимум CPU контейнера за stress-прогін, ліміт вузла БД — 50%):**
+
+| Топологія | Primary | Replica | API (кожен) | Транзакцій на Primary на 1000 запитів | Рядків прочитано на Primary |
+|---|---:|---:|---:|---:|---:|
+| Single Primary | 47% / 52% — **упирається в ліміт** | 2% (простоює) | ~36% | 6 268 | 43 680 378 |
+| Primary + Replica | 28% / 41% | 47% / 54% — **упирається в ліміт** | ~58% | 2 370 | 5 407 189 |
+
+**Результат.**
+
+| Метрика | Single Primary | Primary + Replica | Зміна |
+|---|---:|---:|---:|
+| Пропускна здатність, stress (середнє по рівнях, прогін 1 / 2) | 276.1 / 272.5 | 477.8 / 523.2 | ×1.73 / ×1.92 |
+| Точка насичення (стандартний профіль) | ~50 VU, ~230 RPS: далі RPS не росте, p99 стрибає до 0.3–1.2 с | ~100–200 VU, ~470–540 RPS: до 100 VU p95 = 18 мс | Удвічі пізніше |
+| p95 / p99 на 100 VU (стандартний) | 725.0 / 1 209.0 мс | 18.0 / 201.2 мс | ×40 / ×6 нижче |
+| p99 на 200 VU, stress (прогін 2) | 1 890.0 мс | 1 196.6 мс | −37% |
+| Помилки | 0% | 0% | — |
+
+Винесення читань на репліку подвоїло ресурс БД для змішаного навантаження: запис і strong-читання лишились на Primary, а 80% читань пішли на окремий вузол. Вузьке місце перемістилося з Primary на репліку (47% із 50%), а Primary має запас для записів — наступний крок масштабування — друга репліка з розподілом eventual-читань між ними.
+
+**Чесне застереження: чисте читання майже не виграє.** Сценарій A (100% читань, stress): Single — 313.4 / 276.7 / 279.2 / 273.8 / 261.4 RPS; + Replica — 332.7 / 315.8 / 310.4 / 308.9 / 302.1 RPS (+12%). Усі читання просто переїхали з Primary (CPU 1%) на репліку з тим самим лімітом — сумарний ресурс для читань не змінився. Read Scaling працює, коли (1) є записи, які репліка звільняє від конкуренції з читаннями, або (2) реплік кілька і читання розподіляються між ними. І третє: з увімкненим кешем (ЛР4) більшість читань не доходить ні до Primary, ні до репліки — репліка допомагає на cache miss, на холодному старті після рестарту Redis і для персональних читань, які не кешуються (історія бронювань).
+
+### 11.7. Тести
+
+`tests/TicketBooking.IntegrationTests/ReplicationRoutingTests.cs` (у тестах немає справжньої потокової реплікації, тому «репліка» — той самий PostgreSQL, а «мертва репліка» — неіснуючий хост): eventual-читання йде на репліку, strong — на Primary; після власного запису історія бронювань перевіряє межу запису; репліка недоступна → Primary fallback, і другий запит уже не пробує репліку (circuit breaker); `Replication:Enabled=false` → Single Primary. `LsnTests.cs` — розбір і порівняння LSN. Усього 53 тести, усі проходять; Newman (папки 01, 02, 03, 05): 37 запитів, 123 перевірки, 0 помилок.
+
+### 11.8. Теорія до захисту
+
+**Синхронна, асинхронна і напівсинхронна реплікація.**
+
+| Режим | Коли Primary відповідає клієнту «закомічено» | Втрата даних при падінні Primary | Затримка запису | У PostgreSQL |
+|---|---|---|---|---|
+| Асинхронна (наш стенд) | Одразу після запису WAL на свій диск | Можлива: останні транзакції, які репліка ще не отримала | Мінімальна | `synchronous_standby_names = ''` (за замовчуванням) |
+| Напівсинхронна | Після того, як **хоча б одна** репліка підтвердила отримання (не обов'язково застосування) WAL | Лише якщо одночасно впадуть Primary і та репліка | + 1 мережевий RTT | `synchronous_commit = remote_write` / `on` + `synchronous_standby_names = 'ANY 1 (...)'` |
+| Синхронна | Після того, як репліка **застосувала** WAL (запис видно в читаннях з неї) | Немає (RPO = 0) | + RTT + час застосування; якщо репліка зависла — зависає і запис | `synchronous_commit = remote_apply` |
+
+Ми обрали асинхронну: репліка не впливає на латентність і доступність запису, а її відставання ми явно обробляємо (Read-Your-Writes). Плата — RPO > 0: при втраті Primary можуть зникнути останні мілісекунди транзакцій (у тесті під навантаженням записом — до ~50 КБ WAL, див. 11.3).
+
+**Split-Brain.** Два вузли одночасно вважають себе Primary і приймають записи → дві розбіжні історії даних, які неможливо автоматично злити (наприклад, той самий квиток продано двічі). Виникає, якщо при автоматичному failover старий Primary не помер, а лише втратив мережу з частиною кластера. Захист: кворум (новий лідер обирається більшістю вузлів, меншість не може прийняти записи), fencing / STONITH (старий Primary примусово вимикається або відрізається від сховища), лідерська оренда з TTL (Patroni + etcd). У нашому стенді автоматичного failover немає, тому немає і split-brain: при втраті Primary система свідомо переходить у Read-Only (11.5), а промоут репліки (`pg_ctl promote` / `SELECT pg_promote()`) — ручне рішення оператора.
+
+**CAP-теорема.** При мережевому розділенні (Partition) розподілена система мусить обрати: Consistency (відмовити в операції, якщо не може гарантувати актуальні дані) або Availability (відповісти, ризикуючи застарілими даними). Наш вибір різний для різних операцій:
+- запис і strong-читання (оплата, логін) — **CP**: без Primary повертаємо 503, але не приймаємо запис «кудись»;
+- каталог і схема залу — **AP**: при втраті Primary читаємо з репліки, навіть якщо вона трохи відстає.
+
+**PACELC.** Розширення CAP: якщо Partition — обираємо A чи C; **Else** (у нормальному режимі) — обираємо Latency чи Consistency. Асинхронна репліка — класичний PA/EL: у нормальному режимі ми віддаємо перевагу низькій латентності (не чекаємо репліку при записі), погоджуючись на eventual consistency читань із неї. Read-Your-Writes — точкове повернення до C там, де це помітно користувачу: ціною одного додаткового запиту до репліки (перевірка LSN) або читання з Primary.
+
+**Вибір нового лідера, Raft.** Автоматичний failover потребує консенсусу щодо того, хто новий Primary. Raft: вузли мають терміни (term); якщо фоловер не отримує heartbeat від лідера протягом випадкового election timeout, він стає кандидатом, збільшує term і просить голоси; лідером стає той, хто отримав **більшість** голосів, причому вузол голосує лише за кандидата, чий журнал не старіший за його власний (тому новий лідер має всі закомічені записи). Більшість з N = 2f + 1 вузлів переживає відмову f вузлів, і два лідери в одному term неможливі (дві більшості перетинаються) — це і є захист від split-brain. Для PostgreSQL це роблять зовнішні менеджери: Patroni (лідерство через etcd/Consul/ZooKeeper, які самі працюють на Raft/ZAB), pg_auto_failover, Stolon. Для такого кластера потрібно щонайменше 3 вузли консенсусу.
+
+**Чому не PgBouncer / Pgpool для розділення R/W.** PgBouncer — лише пул з'єднань, маршрутизувати запити за типом він не вміє. Pgpool-II уміє, але аналізує SQL і не знає бізнес-сенсу: він не відрізнить «каталог» від «мої бронювання одразу після оплати». Тому маршрутизація зроблена в коді (`DbRouter`): рівень узгодженості — властивість бізнес-сценарію, а не SQL-запиту.
+
+### 11.9. Як відтворити
+
+```bash
+# Стенд: Primary + Replica (репліка ініціалізується сама через pg_basebackup)
+docker compose up -d --build && docker compose restart nginx
+
+# Стан реплікації: pg_stat_replication на Primary, LSN на репліці
+scripts/replication-status.sh
+
+# Демонстрації: replication | stale-read | replica-down | primary-down | all
+scripts/replication-demo.sh all
+
+# Синтетичний лаг (мс) і вимкнення
+scripts/replica-lag.sh 3000
+scripts/replica-lag.sh 0
+
+# Лаг під навантаженням записом (потрібен k6)
+scripts/replication-lag-under-load.sh
+
+# Порівняння Single Primary vs Primary + Replica (~30 хв)
+load-tests/run-lab6.sh
+python3 load-tests/report.py lab6_D_mixed_single lab6_D_mixed_replica
+```
+
+Якщо після `docker volume rm ticket-booking_pgdata` (новий Primary) репліка не стартує з помилкою `database system identifier differs`, її volume треба теж перестворити: `docker compose rm -sf db-replica && docker volume rm ticket-booking_pgdata-replica && docker compose up -d db-replica`. `docker compose down -v` прибирає обидва volume одразу.

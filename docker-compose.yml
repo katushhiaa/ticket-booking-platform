@@ -9,17 +9,65 @@ services:
       POSTGRES_DB: ticket_booking_db
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
+      # Пароль ролі реплікації (створюється db/primary/initdb при першій ініціалізації volume)
+      REPLICATION_PASSWORD: replicator
+    # Primary (ЛР6): WAL рівня replica для потокової реплікації, до 10 WAL sender-ів,
+    # 256 МБ WAL зберігається для репліки, що відстала; власний pg_hba з правилом для replicator
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - wal_keep_size=256MB
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
     ports:
       - "5432:5432"
     volumes:
       # Іменований volume: дані переживають restart / down (але не down -v)
       - pgdata:/var/lib/postgresql/data
+      - ./db/primary/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./db/primary/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d ticket_booking_db"]
       interval: 5s
       timeout: 5s
       retries: 10
       start_period: 10s
+    networks:
+      - booking-net
+
+  # Read Replica (ЛР6): асинхронна потокова реплікація з Primary (Hot Standby, лише читання).
+  # При першому старті знімає копію Primary через pg_basebackup (db/replica/bootstrap.sh).
+  db-replica:
+    image: postgres:16-alpine
+    container_name: ticket-booking-db-replica
+    restart: unless-stopped
+    user: postgres
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PRIMARY_HOST: db
+      POSTGRES_PASSWORD: postgres
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator
+      REPLICA_NAME: db_replica
+    ports:
+      # 5433 на хості, щоб не конфліктувати з Primary (5432)
+      - "5433:5432"
+    volumes:
+      - pgdata-replica:/var/lib/postgresql/data
+      - ./db/replica/bootstrap.sh:/bootstrap.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ticket_booking_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
     networks:
       - booking-net
 
@@ -53,6 +101,9 @@ services:
       db:
         # API стартує лише після того, як pg_isready відповість успіхом
         condition: service_healthy
+      # Репліка не обов'язкова: без неї читання йдуть на Primary (Primary Fallback)
+      db-replica:
+        condition: service_started
       redis:
         condition: service_healthy
     environment:
@@ -60,6 +111,9 @@ services:
       ASPNETCORE_HTTP_PORTS: "8080"
       # Хост = ім'я сервісу бази у спільній мережі
       ConnectionStrings__DefaultConnection: "Host=db;Port=5432;Database=ticket_booking_db;Username=postgres;Password=postgres;Maximum Pool Size=20"
+      # Read Replica (ЛР6): eventual-читання. Timeout=2 — якщо репліка зависла, швидкий перехід на Primary
+      ConnectionStrings__ReplicaConnection: "Host=db-replica;Port=5432;Database=ticket_booking_db;Username=postgres;Password=postgres;Maximum Pool Size=20;Timeout=2"
+      Replication__Enabled: ${REPLICA_ENABLED:-true}
       ConnectionStrings__RedisConnection: "redis:6379"
       Jwt__SigningKey: "docker-compose-signing-key-for-lab-only-9f3c2a7e5b1d4c6f8a0e"
     networks:
@@ -122,6 +176,7 @@ services:
 
 volumes:
   pgdata:
+  pgdata-replica:
 
 networks:
   booking-net:

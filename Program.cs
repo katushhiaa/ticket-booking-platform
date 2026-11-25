@@ -12,6 +12,7 @@ using TicketBooking.Api.Auth;
 using TicketBooking.Api.Data;
 using TicketBooking.Api.Infrastructure;
 using TicketBooking.Api.Infrastructure.Caching;
+using TicketBooking.Api.Infrastructure.Replication;
 using TicketBooking.Api.Models;
 using TicketBooking.Api.Services;
 using TicketBooking.Api.Validation;
@@ -34,6 +35,26 @@ if (minWorkers > 0 || minIocp > 0)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection"))
         .AddInterceptors(new PooledConnectionValidator()));
+
+// ---------- Read/Write Separation (ЛР6) ----------
+// Primary — AppDbContext вище (усі записи й транзакції). Read Replica — окремий пул з'єднань;
+// вузол для кожного читання обирає DbRouter за вимогою узгодженості сценарію.
+builder.Services.Configure<ReplicationSettings>(builder.Configuration.GetSection(ReplicationSettings.SectionName));
+// Рядок підключення читаємо з IConfiguration у фабриці (а не при побудові builder), щоб діяли перевизначення в тестах
+builder.Services.AddSingleton(sp =>
+{
+    var replicaConnection = sp.GetRequiredService<IConfiguration>().GetConnectionString("ReplicaConnection");
+    return new ReplicaDbOptions(string.IsNullOrWhiteSpace(replicaConnection)
+        ? null
+        : new DbContextOptionsBuilder<AppDbContext>()
+            .UseNpgsql(replicaConnection)
+            .UseQueryTrackingBehavior(QueryTrackingBehavior.NoTracking)
+            .AddInterceptors(new PooledConnectionValidator())
+            .Options);
+});
+builder.Services.AddSingleton<ReplicaHealth>();
+builder.Services.AddScoped<DbRouter>();
+builder.Services.AddHttpContextAccessor();
 
 // ---------- Distributed Cache (Redis, Cache-Aside — ЛР4) ----------
 builder.Services.Configure<CacheSettings>(builder.Configuration.GetSection(CacheSettings.SectionName));

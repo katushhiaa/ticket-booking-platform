@@ -16,13 +16,23 @@ services:
       Logging__LogLevel__Default: Warning
       Logging__LogLevel__Microsoft.AspNetCore: Warning
       Cache__Enabled: ${CACHE_ENABLED:-true}
+      # REPLICA_ENABLED=false — топологія Single Primary (усі читання на Primary), ЛР6
+      Replication__Enabled: ${REPLICA_ENABLED:-true}
 
   db:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
+          # DB_CPUS — ліміт CPU кожного вузла БД (ЛР6 порівнює однакові вузли: 1 Primary vs Primary + Replica)
+          cpus: "${DB_CPUS:-2.0}"
           memory: 1G
+
+  db-replica:
+    deploy:
+      resources:
+        limits:
+          cpus: "${DB_CPUS:-2.0}"
+          memory: 768M
 
   redis:
     deploy:

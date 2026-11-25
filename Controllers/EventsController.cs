@@ -2,13 +2,14 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using TicketBooking.Api.Data;
 using TicketBooking.Api.Infrastructure.Caching;
+using TicketBooking.Api.Infrastructure.Replication;
 using TicketBooking.Api.Models.Enums;
 
 namespace TicketBooking.Api.Controllers;
 
 [ApiController]
 [Route("api/v1/events")]
-public class EventsController(AppDbContext db, ResilientCache cache) : ControllerBase
+public class EventsController(DbRouter router, ResilientCache cache) : ControllerBase
 {
     // GET /api/v1/events
     /// <summary>Каталог подій. Cache-Aside, TTL 5 хв (записів через API немає — лише expiration).</summary>
@@ -18,7 +19,8 @@ public class EventsController(AppDbContext db, ResilientCache cache) : Controlle
         var (payload, result) = await cache.GetOrCreateAsync(
             CacheKeys.EventCatalog(city),
             cache.CatalogTtl,
-            async token =>
+            // Публічний каталог: Eventual Consistency → Read Replica (ЛР6)
+            token => router.ReadAsync(ReadConsistency.Eventual, null, async (db, token) =>
             {
                 var query = db.Events.AsNoTracking().Include(e => e.Venue).AsQueryable();
 
@@ -42,7 +44,7 @@ public class EventsController(AppDbContext db, ResilientCache cache) : Controlle
                         e.Venue.TotalCapacity
                     }
                 }).ToListAsync(token);
-            },
+            }, token),
             ct);
 
         return CachedJson(payload!, result);
@@ -56,7 +58,9 @@ public class EventsController(AppDbContext db, ResilientCache cache) : Controlle
         var (payload, result) = await cache.GetOrCreateAsync(
             CacheKeys.EventTickets(id, status),
             cache.TicketsTtl,
-            async token =>
+            // Схема залу допускає Eventual Consistency, але після бронювання ця подія має «межу запису»:
+            // поки репліка її не наздогнала, кеш заповнюється з Primary (інакше в кеш на 30 с потрапив би стан до запису)
+            token => router.ReadAsync(ReadConsistency.ReadYourWrites, DbRouter.EventScope(id), async (db, token) =>
             {
                 var evExists = await db.Events.AnyAsync(e => e.Id == id, token);
                 if (!evExists)
@@ -83,7 +87,7 @@ public class EventsController(AppDbContext db, ResilientCache cache) : Controlle
                 }).ToListAsync(token);
 
                 return new { eventId = id, tickets };
-            },
+            }, token),
             ct);
 
         if (payload is null)

@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using System.Net.Sockets;
 using Npgsql;
 
 namespace TicketBooking.Api.Infrastructure;
@@ -36,7 +37,16 @@ public sealed class GlobalExceptionHandler(
                 "Некоректний запит",
                 "Сервер не зміг обробити тіло або параметри запиту."),
 
-            NpgsqlException or TimeoutException => (
+            // Primary недоступний, а запит змінює дані: система в режимі лише читання (ЛР6, Graceful Degradation).
+            // Читання каталогу при цьому продовжує обслуговувати репліка.
+            NpgsqlException or TimeoutException or SocketException when !HttpMethods.IsGet(httpContext.Request.Method) => (
+                StatusCodes.Status503ServiceUnavailable,
+                "Система в режимі лише читання",
+                "Основний вузол бази даних (Primary) недоступний: операції запису тимчасово заблоковано. " +
+                "Перегляд каталогу працює. Спробуйте пізніше."),
+
+            // SocketException: ім'я вузла БД не резолвиться (контейнер зупинено) — Npgsql пробрасує його без обгортки
+            NpgsqlException or TimeoutException or SocketException => (
                 StatusCodes.Status503ServiceUnavailable,
                 "База даних тимчасово недоступна",
                 "Не вдалося виконати запит до сховища даних. Спробуйте пізніше."),
@@ -77,6 +87,10 @@ public sealed class GlobalExceptionHandler(
         }
 
         httpContext.Response.StatusCode = statusCode;
+        if (statusCode == StatusCodes.Status503ServiceUnavailable)
+        {
+            httpContext.Response.Headers.RetryAfter = "10";
+        }
 
         return await problemDetailsService.TryWriteAsync(new ProblemDetailsContext
         {
