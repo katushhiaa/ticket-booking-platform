@@ -34,6 +34,35 @@ services:
           cpus: "${DB_CPUS:-2.0}"
           memory: 768M
 
+  # Шарди (ЛР7): SHARD_CPUS — ліміт кожного вузла (Single Node і Sharded порівнюються на однакових вузлах)
+  shard-a:
+    deploy:
+      resources:
+        limits:
+          cpus: "${SHARD_CPUS:-2.0}"
+          memory: 512M
+
+  shard-b:
+    deploy:
+      resources:
+        limits:
+          cpus: "${SHARD_CPUS:-2.0}"
+          memory: 512M
+
+  shard-a-replica:
+    deploy:
+      resources:
+        limits:
+          cpus: "${SHARD_CPUS:-2.0}"
+          memory: 512M
+
+  shard-b-replica:
+    deploy:
+      resources:
+        limits:
+          cpus: "${SHARD_CPUS:-2.0}"
+          memory: 512M
+
   redis:
     deploy:
       resources:

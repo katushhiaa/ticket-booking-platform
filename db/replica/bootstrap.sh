@@ -41,7 +41,10 @@ fi
 
 # recovery_min_apply_delay НЕ передаємо через -c: тоді його можна міняти на ходу
 # (ALTER SYSTEM + pg_reload_conf, scripts/replica-lag.sh) для демонстрації Replication Lag
+# "$@" — додаткові параметри з command сервісу. Репліки шардів (ЛР7) передають max_prepared_transactions:
+# Hot Standby відмовляється стартувати, якщо цей параметр менший, ніж на Primary.
 exec postgres \
   -c hot_standby=on \
   -c hot_standby_feedback=on \
-  -c max_standby_streaming_delay=5s
+  -c max_standby_streaming_delay=5s \
+  "$@"

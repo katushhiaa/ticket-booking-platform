@@ -1,0 +1,1 @@
+{"strategy":"VirtualBuckets","inserted":[99243,100757],"shards":[{"shard":"shard-a","orders":99243,"dataShare":49.6215,"writeOps":99243,"writeShare":49.6215},{"shard":"shard-b","orders":100757,"dataShare":50.3785,"writeOps":100757,"writeShare":50.3785}]}

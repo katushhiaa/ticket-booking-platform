@@ -4,13 +4,18 @@ using TicketBooking.Api.Contracts;
 using TicketBooking.Api.Data;
 using TicketBooking.Api.Infrastructure.Caching;
 using TicketBooking.Api.Infrastructure.Replication;
+using TicketBooking.Api.Infrastructure.Sharding;
 using TicketBooking.Api.Models;
 using TicketBooking.Api.Models.Enums;
 
 namespace TicketBooking.Api.Controllers;
 
 [Route("api/v1/bookings")]
-public class BookingsController(DbRouter router, ResilientCache cache, ILogger<BookingsController> logger) : ApiControllerBase
+public class BookingsController(
+    DbRouter router,
+    ResilientCache cache,
+    ShardedOrderStore orders,
+    ILogger<BookingsController> logger) : ApiControllerBase
 {
     // Усі мутації — лише на Primary (ЛР6)
     private AppDbContext db => router.Primary;
@@ -258,6 +263,7 @@ public class BookingsController(DbRouter router, ResilientCache cache, ILogger<B
         logger.LogInformation("Booking {BookingId} confirmed, payment {PaymentId}", booking.Id, paymentTransactionId);
         await RecordWrite(booking.UserId, booking.Tickets.Select(t => t.EventId));
         await InvalidateTicketsCache(booking.Tickets.Select(t => t.EventId), "booking confirmed");
+        await RecordOrder(booking);
 
         var response = new ConfirmBookingResponse(
             booking.Id,
@@ -365,6 +371,36 @@ public class BookingsController(DbRouter router, ResilientCache cache, ILogger<B
     {
         await db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);
+    }
+
+    /// <summary>
+    /// Оплачене бронювання → замовлення на шарді користувача (ЛР7). Основна БД і шард — різні вузли, тому це
+    /// не одна ACID-транзакція: бронювання вже закомічено, а запис замовлення ідемпотентний (унікальний BookingId),
+    /// тож його можна безпечно повторити (у продакшені — через Transactional Outbox, див. README 12.6).
+    /// </summary>
+    private async Task RecordOrder(Booking booking)
+    {
+        if (!orders.Router.Enabled || booking.Tickets.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await orders.RecordPurchaseAsync(new Order
+            {
+                UserId = booking.UserId,
+                EventId = booking.Tickets[0].EventId,
+                BookingId = booking.Id,
+                TicketCount = booking.Tickets.Count,
+                Amount = booking.TotalAmount,
+                CreatedAt = DateTime.UtcNow
+            }, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning("Order for booking {BookingId} not recorded on shard: {Message}", booking.Id, ex.Message);
+        }
     }
 
     private Task RecordWrite(Guid userId, IEnumerable<Guid> eventIds) =>

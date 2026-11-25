@@ -1,0 +1,80 @@
+{
+  "scenario": "E: Orders (write)",
+  "label": "lab7_E_write_single_stress",
+  "config": {
+    "baseUrl": "http://localhost",
+    "levels": [
+      10,
+      25,
+      50,
+      100,
+      200
+    ],
+    "holdSeconds": 30,
+    "rampSeconds": 5,
+    "warmupSeconds": 20,
+    "think": "0"
+  },
+  "rows": [
+    {
+      "vus": 10,
+      "requests": 14214,
+      "rps": 473.8,
+      "avg": 14165.277880258898,
+      "p50": 4.1035,
+      "p90": 8.498,
+      "p95": 31.538399999999985,
+      "p99": 46.84025999999999,
+      "max": 33541433.931,
+      "errorRate": 0.0002814126917123962
+    },
+    {
+      "vus": 25,
+      "requests": 0,
+      "rps": 0,
+      "avg": 0,
+      "p50": 0,
+      "p90": 0,
+      "p95": 0,
+      "p99": 0,
+      "max": 0,
+      "errorRate": 0
+    },
+    {
+      "vus": 50,
+      "requests": 0,
+      "rps": 0,
+      "avg": 0,
+      "p50": 0,
+      "p90": 0,
+      "p95": 0,
+      "p99": 0,
+      "max": 0,
+      "errorRate": 0
+    },
+    {
+      "vus": 100,
+      "requests": 0,
+      "rps": 0,
+      "avg": 0,
+      "p50": 0,
+      "p90": 0,
+      "p95": 0,
+      "p99": 0,
+      "max": 0,
+      "errorRate": 0
+    },
+    {
+      "vus": 200,
+      "requests": 0,
+      "rps": 0,
+      "avg": 0,
+      "p50": 0,
+      "p90": 0,
+      "p95": 0,
+      "p99": 0,
+      "max": 0,
+      "errorRate": 0
+    }
+  ]
+}

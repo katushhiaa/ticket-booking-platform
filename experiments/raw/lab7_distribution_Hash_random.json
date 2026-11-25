@@ -1,0 +1,1 @@
+{"strategy":"Hash","inserted":[99924,100076],"shards":[{"shard":"shard-a","orders":99924,"dataShare":49.962,"writeOps":99924,"writeShare":49.962},{"shard":"shard-b","orders":100076,"dataShare":50.038,"writeOps":100076,"writeShare":50.038}]}

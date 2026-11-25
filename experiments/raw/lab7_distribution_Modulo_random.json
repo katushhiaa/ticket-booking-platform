@@ -1,0 +1,1 @@
+{"strategy":"Modulo","inserted":[99509,100491],"shards":[{"shard":"shard-a","orders":99509,"dataShare":49.7545,"writeOps":99509,"writeShare":49.7545},{"shard":"shard-b","orders":100491,"dataShare":50.2455,"writeOps":100491,"writeShare":50.2455}]}

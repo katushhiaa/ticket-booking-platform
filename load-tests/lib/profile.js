@@ -48,7 +48,7 @@ export function buildOptions(extraPerStageMetrics = []) {
     thresholds[`http_reqs{stage:${tag}}`] = ['count>=0'];
     thresholds[`http_req_failed{stage:${tag}}`] = ['rate>=0'];
     for (const m of extraPerStageMetrics) {
-      thresholds[`${m.name}{stage:${tag}}`] = [m.type === 'rate' ? 'rate>=0' : 'count>=0'];
+      thresholds[`${m.name}{stage:${tag}}`] = [m.type === 'rate' ? 'rate>=0' : m.type === 'trend' ? 'max>=0' : 'count>=0'];
     }
   }
 
@@ -79,7 +79,13 @@ export function buildSummary(data, scenario, extraPerStageMetrics = []) {
     };
     for (const m of extraPerStageMetrics) {
       const v = data.metrics[`${m.name}{stage:${tag}}`]?.values || {};
-      row[m.name] = m.type === 'rate' ? v.rate : (v.count || 0) / HOLD;
+      if (m.type === 'trend') {
+        // Окремі перцентилі для типу операції (наприклад, лише записи у змішаному навантаженні)
+        row[`${m.name}_p95`] = v['p(95)'];
+        row[`${m.name}_p99`] = v['p(99)'];
+      } else {
+        row[m.name] = m.type === 'rate' ? v.rate : (v.count || 0) / HOLD;
+      }
     }
     return row;
   });

@@ -71,6 +71,122 @@ services:
     networks:
       - booking-net
 
+  # Шарди замовлень (ЛР7): два незалежні вузли PostgreSQL, кожен зберігає свою частину таблиці Orders.
+  # max_prepared_transactions > 0 — для двофазної фіксації (PREPARE TRANSACTION) при міжшардовій передачі замовлення.
+  shard-a:
+    image: postgres:16-alpine
+    container_name: ticket-booking-shard-a
+    restart: unless-stopped
+    # Кожен шард — Primary зі своєю Read Replica (як основна БД у ЛР6): той самий pg_hba і роль replicator
+    command: ["postgres", "-c", "max_prepared_transactions=20", "-c", "wal_level=replica", "-c", "max_wal_senders=10",
+              "-c", "wal_keep_size=128MB", "-c", "hba_file=/etc/postgresql/pg_hba.conf"]
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      REPLICATION_PASSWORD: replicator
+    ports:
+      - "5441:5432"
+    volumes:
+      - shard-a-data:/var/lib/postgresql/data
+      - ./db/primary/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./db/primary/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - booking-net
+
+  shard-b:
+    image: postgres:16-alpine
+    container_name: ticket-booking-shard-b
+    restart: unless-stopped
+    # Кожен шард — Primary зі своєю Read Replica (як основна БД у ЛР6): той самий pg_hba і роль replicator
+    command: ["postgres", "-c", "max_prepared_transactions=20", "-c", "wal_level=replica", "-c", "max_wal_senders=10",
+              "-c", "wal_keep_size=128MB", "-c", "hba_file=/etc/postgresql/pg_hba.conf"]
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      REPLICATION_PASSWORD: replicator
+    ports:
+      - "5442:5432"
+    volumes:
+      - shard-b-data:/var/lib/postgresql/data
+      - ./db/primary/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./db/primary/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - booking-net
+
+  # Репліка шарду (ЛР7): Hot Standby, асинхронна потокова реплікація з shard-a. Читає аналітика (Scatter-Gather).
+  shard-a-replica:
+    image: postgres:16-alpine
+    container_name: ticket-booking-shard-a-replica
+    restart: unless-stopped
+    user: postgres
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
+    command: ["-c", "max_prepared_transactions=20"]
+    depends_on:
+      shard-a:
+        condition: service_healthy
+    environment:
+      PRIMARY_HOST: shard-a
+      POSTGRES_PASSWORD: postgres
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator
+      REPLICA_NAME: shard_a_replica
+    ports:
+      - "5443:5432"
+    volumes:
+      - shard-a-replica-data:/var/lib/postgresql/data
+      - ./db/replica/bootstrap.sh:/bootstrap.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks:
+      - booking-net
+
+  # Репліка шарду (ЛР7): Hot Standby, асинхронна потокова реплікація з shard-b. Читає аналітика (Scatter-Gather).
+  shard-b-replica:
+    image: postgres:16-alpine
+    container_name: ticket-booking-shard-b-replica
+    restart: unless-stopped
+    user: postgres
+    entrypoint: ["/bin/sh", "/bootstrap.sh"]
+    command: ["-c", "max_prepared_transactions=20"]
+    depends_on:
+      shard-b:
+        condition: service_healthy
+    environment:
+      PRIMARY_HOST: shard-b
+      POSTGRES_PASSWORD: postgres
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator
+      REPLICA_NAME: shard_b_replica
+    ports:
+      - "5444:5432"
+    volumes:
+      - shard-b-replica-data:/var/lib/postgresql/data
+      - ./db/replica/bootstrap.sh:/bootstrap.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks:
+      - booking-net
+
   redis:
     image: redis:7-alpine
     container_name: ticket-booking-redis
@@ -104,6 +220,15 @@ services:
       # Репліка не обов'язкова: без неї читання йдуть на Primary (Primary Fallback)
       db-replica:
         condition: service_started
+      shard-a:
+        condition: service_healthy
+      shard-b:
+        condition: service_healthy
+      # Репліки шардів не обов'язкові: без них аналітика читає з Primary шарду
+      shard-a-replica:
+        condition: service_started
+      shard-b-replica:
+        condition: service_started
       redis:
         condition: service_healthy
     environment:
@@ -116,6 +241,18 @@ services:
       Replication__Enabled: ${REPLICA_ENABLED:-true}
       ConnectionStrings__RedisConnection: "redis:6379"
       Jwt__SigningKey: "docker-compose-signing-key-for-lab-only-9f3c2a7e5b1d4c6f8a0e"
+      # Шардинг замовлень (ЛР7): ключ — UserId, стратегія VirtualBuckets (64 бакети).
+      # SHARD_STRATEGY=Modulo|Hash|VirtualBuckets, SHARD_COUNT=1 — топологія Single Node для порівняння
+      Sharding__Strategy: ${SHARD_STRATEGY:-VirtualBuckets}
+      Sharding__ActiveShards: ${SHARD_COUNT:-0}
+      Sharding__Shards__0__Name: shard-a
+      Sharding__Shards__0__ConnectionString: "Host=shard-a;Port=5432;Database=orders;Username=postgres;Password=postgres;Maximum Pool Size=20;Timeout=3"
+      Sharding__Shards__1__Name: shard-b
+      Sharding__Shards__1__ConnectionString: "Host=shard-b;Port=5432;Database=orders;Username=postgres;Password=postgres;Maximum Pool Size=20;Timeout=3"
+      # Репліки шардів: аналітика (/orders/stats) читає з них. SHARD_ANALYTICS=Primary — аналітика на Primary шардів
+      Sharding__AnalyticsReads: ${SHARD_ANALYTICS:-Replica}
+      Sharding__Shards__0__ReplicaConnectionString: "Host=shard-a-replica;Port=5432;Database=orders;Username=postgres;Password=postgres;Maximum Pool Size=20;Timeout=2"
+      Sharding__Shards__1__ReplicaConnectionString: "Host=shard-b-replica;Port=5432;Database=orders;Username=postgres;Password=postgres;Maximum Pool Size=20;Timeout=2"
     networks:
       - booking-net
 
@@ -177,6 +314,10 @@ services:
 volumes:
   pgdata:
   pgdata-replica:
+  shard-a-data:
+  shard-b-data:
+  shard-a-replica-data:
+  shard-b-replica-data:
 
 networks:
   booking-net:

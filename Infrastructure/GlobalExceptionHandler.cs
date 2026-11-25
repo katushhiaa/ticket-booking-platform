@@ -20,6 +20,15 @@ public sealed class GlobalExceptionHandler(
         Exception exception,
         CancellationToken cancellationToken)
     {
+        // EF Core загортає помилки з'єднання (зокрема вичерпаний пул Npgsql) в InvalidOperationException.
+        // Без розгортання це був би 500, а Nginx вважає 500 відмовою інстансу (proxy_next_upstream http_500)
+        // і під перевантаженням БД виключав з ротації всі інстанси API (no live upstreams, ЛР7, README 12.8)
+        if (exception is InvalidOperationException { InnerException: { } inner } &&
+            FindDatabaseUnavailable(inner) is { } dbError)
+        {
+            exception = dbError;
+        }
+
         var (statusCode, title, detail) = exception switch
         {
             DbUpdateConcurrencyException => (
@@ -98,5 +107,17 @@ public sealed class GlobalExceptionHandler(
             ProblemDetails = problem,
             Exception = exception
         });
+    }
+
+    private static Exception? FindDatabaseUnavailable(Exception? ex)
+    {
+        for (; ex is not null; ex = ex.InnerException)
+        {
+            if (ex is NpgsqlException or TimeoutException or SocketException)
+            {
+                return ex;
+            }
+        }
+        return null;
     }
 }
