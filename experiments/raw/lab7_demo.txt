@@ -1,0 +1,49 @@
+
+=== 2.2 Детермінована маршрутизація: UserId → hash → бакет → шард ===
+стратегія: VirtualBuckets
+користувач ddc0c740-fde6-4679-a073-923ab1a9ef14 → shard-b bucket 27 hash 525a9d99d612611b
+   POST /orders → X-Shard: shard-b
+   POST /orders → X-Shard: shard-b
+   рядків цього користувача на shard-a: 0
+   рядків цього користувача на shard-b: 2
+користувач 5bda8883-cb53-41e8-b328-4d5c5aadc10c → shard-b bucket 55 hash 3b349150ac3d6937
+   POST /orders → X-Shard: shard-b
+   POST /orders → X-Shard: shard-b
+   рядків цього користувача на shard-a: 0
+   рядків цього користувача на shard-b: 2
+користувач 87f86f1f-78cc-402d-9c75-1f4d2e853522 → shard-b bucket 35 hash 547cb4910b1be8a3
+   POST /orders → X-Shard: shard-b
+   POST /orders → X-Shard: shard-b
+   рядків цього користувача на shard-a: 0
+   рядків цього користувача на shard-b: 2
+
+=== 2.4 Shard-Local vs Cross-Shard (Scatter-Gather) ===
+--- «мої замовлення» шард-локально (1 шард):
+  замовлень: 7 | шарди: [('shard-a', 2.0)]
+--- той самий запит через fan-out (усі шарди + злиття):
+  замовлень: 7 | шарди: [('shard-a', 1.4, 7), ('shard-b', 0.9, 0)]
+--- аналітика продажів події (GROUP BY на кожному шарді, сума на координаторі):
+   {'eventId': 'c0ffee0e-0000-4000-8000-000000000003', 'orders': 9968, 'tickets': 24741, 'revenue': 17350500.0} | шарди: [('shard-a', 6.2), ('shard-b', 6.0)]
+--- час відповіді (curl, 20 запитів, медіана):
+   users/c0ffee03-0000-4000-8000-000000000042/orders?limit=20                2.9 мс
+   users/c0ffee03-0000-4000-8000-000000000042/orders?limit=20&scatter=true    3.0 мс
+   orders/stats?eventId=c0ffee0e-0000-4000-8000-000000000003                 4.7 мс
+   orders/stats                                                             16.9 мс
+
+=== 2.4 Cross-Shard Write: передача замовлення іншому користувачу ===
+--- обидва користувачі на shard-a → звичайна локальна ACID-транзакція:
+   {'orderId': '0b40eae8-061e-45d4-b385-3bc8e0897166', 'outcome': 'SameShard', 'from': 'shard-a', 'to': 'shard-a', 'gid': None}
+--- shard-a → shard-b → двофазна фіксація (PREPARE TRANSACTION / COMMIT PREPARED):
+   {'orderId': '292668e3-d573-4c8e-b1f2-c7872fc53614', 'outcome': 'TwoPhaseCommitted', 'from': 'shard-a', 'to': 'shard-b', 'gid': 'tb-transfer-292668e3d5734c8eb1f2c7872fc53614-20261124230228015'}
+   shard-a: 0 рядків, shard-b: 1 рядків
+--- той самий 2PC, але координатор «падає» після PREPARE (simulateCoordinatorCrash):
+   HTTP 202
+   pg_prepared_xacts:
+     shard-a: tb-transfer-cab8728937e643a5b7468a0710e0a5db-20261124230228267:shard-a
+     shard-b: tb-transfer-cab8728937e643a5b7468a0710e0a5db-20261124230228267:shard-b
+   рядок на shard-a заблоковано in-doubt транзакцією — спроба змінити його чекає (lock_timeout 2 с):
+     ERROR:  canceling statement due to lock timeout
+   зміни ще не видно: shard-a 1, shard-b 0
+--- відновлення координатора: обидва учасники підготовані → COMMIT PREPARED:
+   [{'gid': 'tb-transfer-cab8728937e643a5b7468a0710e0a5db-20261124230228267', 'decision': 'commit'}]
+   shard-a: 0 рядків, shard-b: 1 рядків

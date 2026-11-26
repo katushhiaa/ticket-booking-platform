@@ -16,6 +16,8 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
 {
     private readonly PostgreSqlContainer _postgres = new PostgreSqlBuilder()
         .WithImage("postgres:16-alpine")
+        // 2PC між шардами (ЛР7) потребує PREPARE TRANSACTION
+        .WithCommand("-c", "max_prepared_transactions=10")
         .Build();
 
     private readonly RedisContainer _redis = new RedisBuilder()
@@ -25,7 +27,16 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
     /// <summary>Рядок підключення до тестового PostgreSQL (у тестах ЛР6 ним же імітується «репліка»).</summary>
     public string PostgresConnectionString => _postgres.GetConnectionString();
 
-    public async Task InitializeAsync() => await Task.WhenAll(_postgres.StartAsync(), _redis.StartAsync());
+    public async Task InitializeAsync()
+    {
+        await Task.WhenAll(_postgres.StartAsync(), _redis.StartAsync());
+        // Два логічні шарди замовлень (ЛР7) — окремі бази в тому самому PostgreSQL
+        await ExecuteSqlAsync("CREATE DATABASE shard_a");
+        await ExecuteSqlAsync("CREATE DATABASE shard_b");
+    }
+
+    public string ShardConnectionString(string database) =>
+        new NpgsqlConnectionStringBuilder(_postgres.GetConnectionString()) { Database = database }.ConnectionString;
 
     public new async Task DisposeAsync()
     {
@@ -45,7 +56,11 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
                 ["ConnectionStrings:DefaultConnection"] = _postgres.GetConnectionString(),
                 ["ConnectionStrings:RedisConnection"] = _redis.GetConnectionString(),
                 // У тестах повторне видалення ключів (double delete) не потрібне й заважало б перевіркам
-                ["Cache:InvalidationRetryDelayMs"] = "0"
+                ["Cache:InvalidationRetryDelayMs"] = "0",
+                ["Sharding:Shards:0:Name"] = "shard-a",
+                ["Sharding:Shards:0:ConnectionString"] = ShardConnectionString("shard_a"),
+                ["Sharding:Shards:1:Name"] = "shard-b",
+                ["Sharding:Shards:1:ConnectionString"] = ShardConnectionString("shard_b")
             }));
     }
 
@@ -61,6 +76,8 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
             DELETE FROM "Users" WHERE "Email" <> 'katerina@example.com';
             """);
         await FlushCacheAsync();
+        await ExecuteSqlAsync("TRUNCATE \"Orders\"", ShardConnectionString("shard_a"));
+        await ExecuteSqlAsync("TRUNCATE \"Orders\"", ShardConnectionString("shard_b"));
     }
 
     public async Task FlushCacheAsync()
@@ -72,9 +89,9 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         }
     }
 
-    public async Task ExecuteSqlAsync(string sql)
+    public async Task ExecuteSqlAsync(string sql, string? connectionString = null)
     {
-        await using var connection = new NpgsqlConnection(_postgres.GetConnectionString());
+        await using var connection = new NpgsqlConnection(connectionString ?? _postgres.GetConnectionString());
         await connection.OpenAsync();
         await using var command = new NpgsqlCommand(sql, connection);
         await command.ExecuteNonQueryAsync();

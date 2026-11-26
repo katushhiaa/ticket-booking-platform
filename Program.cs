@@ -13,6 +13,7 @@ using TicketBooking.Api.Data;
 using TicketBooking.Api.Infrastructure;
 using TicketBooking.Api.Infrastructure.Caching;
 using TicketBooking.Api.Infrastructure.Replication;
+using TicketBooking.Api.Infrastructure.Sharding;
 using TicketBooking.Api.Models;
 using TicketBooking.Api.Services;
 using TicketBooking.Api.Validation;
@@ -53,6 +54,12 @@ builder.Services.AddSingleton(sp =>
             .Options);
 });
 builder.Services.AddSingleton<ReplicaHealth>();
+
+// ---------- Sharding: замовлення (ЛР7) ----------
+// Application-Level Sharding: ShardRouter за UserId обчислює вузол, ShardedOrderStore виконує запит на ньому
+builder.Services.Configure<ShardingSettings>(builder.Configuration.GetSection(ShardingSettings.SectionName));
+builder.Services.AddSingleton<ShardRouter>();
+builder.Services.AddSingleton<ShardedOrderStore>();
 builder.Services.AddScoped<DbRouter>();
 builder.Services.AddHttpContextAccessor();
 
@@ -222,6 +229,13 @@ using (var scope = app.Services.CreateScope())
     {
         await new NpgsqlCommand("SELECT pg_advisory_unlock(20260001)", lockConnection).ExecuteNonQueryAsync();
     }
+}
+
+// Схема таблиці Orders на кожному шарді (ЛР7). Недоступний шард не зупиняє старт API.
+var orderStore = app.Services.GetRequiredService<ShardedOrderStore>();
+if (orderStore.Router.Enabled)
+{
+    await orderStore.EnsureSchemaAsync();
 }
 
 // Swagger доступний завжди (навчальний проєкт, потрібен і в Docker)

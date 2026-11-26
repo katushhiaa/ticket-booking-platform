@@ -1,0 +1,1 @@
+{"strategy":"VirtualBuckets","inserted":[200000],"shards":[{"shard":"shard-a","orders":200000,"dataShare":100,"writeOps":200000,"writeShare":100}]}
